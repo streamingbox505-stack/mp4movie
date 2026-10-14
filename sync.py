@@ -6,16 +6,24 @@
    kwenye HF Dataset kama videos/<jina>.mp4 — kwa kutumia pipeline ile ile ya app.py
    (kwa hiyo jina la faili linalingana na kile movie-public inachotarajia).
 Env: SYNC_URL, HF_TOKEN (lazima) | SYNC_KEY, HF_REPO, BATCH, BUDGET_MIN (hiari).
+Kasi: `python sync.py --plan todo.json` huorodhesha zilizobaki mara moja; kisha kila shard (SHARD/SHARDS, SEED,
+TODO_FILE) huchukua sehemu yake na kuzibadilisha sambamba na shard zingine (GitHub matrix).
 """
 import json, os, random, sys, time
 import urllib.parse, urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SYNC_URL = os.environ.get("SYNC_URL", "").strip()
 SYNC_KEY = os.environ.get("SYNC_KEY", "").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 HF_REPO = os.environ.get("HF_REPO", "JAYNESTV/iphone-stream").strip()
-BATCH = int(os.environ.get("BATCH", "5"))          # video ngapi kwa kila run
+BATCH = int(os.environ.get("BATCH", "10"))         # video ngapi kwa kila shard kwa run (0 = zote hadi muda uishe)
+SHARD = int(os.environ.get("SHARD", "0"))          # shard hii ni ya ngapi (0-based)
+SHARDS = max(1, int(os.environ.get("SHARDS", "1")))  # shard ngapi kwa jumla
+SEED = os.environ.get("SEED") or str(time.time())   # seed ileile kwa shard zote za run moja
+TODO_FILE = os.environ.get("TODO_FILE", "").strip()   # orodha iliyoandaliwa na `--plan`
+SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", "3"))  # kurasa ngapi za movie-public kwa pamoja
 BUDGET_MIN = int(os.environ.get("BUDGET_MIN", "300"))  # acha kuanza kazi mpya baada ya dakika hizi
 
 
@@ -32,21 +40,37 @@ def fetch_json(url, tries=3):
             time.sleep(5 * (i + 1))
 
 
+def _page(offset):
+    qs = urllib.parse.urlencode(
+        {"action": "all", "convert": "1", "verify": "1", "limit": 10, "offset": offset})
+    data = fetch_json(f"{SYNC_URL}?{qs}")
+    if not data.get("ok"):
+        raise RuntimeError(data.get("error", "movie-public imejibu kosa"))
+    return data
+
+
 def fetch_missing():
-    """Episodes zote zisizo kwenye dataset (kurasa 10 kwa ombi, hadi done=true)."""
-    missing, offset = {}, 0
-    while True:
-        qs = urllib.parse.urlencode(
-            {"action": "all", "convert": "1", "verify": "1", "limit": 10, "offset": offset})
-        data = fetch_json(f"{SYNC_URL}?{qs}")
-        if not data.get("ok"):
-            raise RuntimeError(data.get("error", "movie-public imejibu kosa"))
+    """Episodes zote zisizo kwenye dataset. Ukurasa wa kwanza unatoa `total`; kurasa zilizobaki zinaombwa sambamba."""
+    first = _page(0)
+    pages = [first]
+    total = int(first.get("total") or 0)
+    if not first.get("done") and total > 10:
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+            pages += list(ex.map(_page, range(10, total, 10)))
+    missing = {}
+    for data in pages:
         for m in data.get("unconverted", []):
             if m.get("reason") == "not_in_dataset" and m.get("drive_id"):
                 missing.setdefault(m["drive_id"], m)
-        if data.get("done"):
-            return list(missing.values())
-        offset = data["next_offset"]
+    return list(missing.values())
+
+
+def pick_mine(todo):
+    """Changanya kwa SEED ileile (kwa shard zote), kisha chukua kila SHARDS-th kuanzia SHARD."""
+    todo = sorted(todo, key=lambda m: m["drive_id"])
+    random.Random(SEED).shuffle(todo)  # zinazoshindwa kila mara zisizuie zingine
+    mine = todo[SHARD::SHARDS]
+    return mine[:BATCH] if BATCH > 0 else mine
 
 
 def load_converter():
@@ -64,12 +88,22 @@ def main():
             print(f"❌ Secret {k} haijawekwa.")
             return 2
     started = time.time()
+    if "--plan" in sys.argv:  # hatua ya kupanga: orodhesha mara moja, hakuna ubadilishaji
+        i = sys.argv.index("--plan")
+        path = sys.argv[i + 1] if len(sys.argv) > i + 1 else "todo.json"
+        todo = fetch_missing()
+        Path(path).write_text(json.dumps(todo), encoding="utf-8")
+        if os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                f.write(f"count={len(todo)}\n")
+        print(f"Zisizo kwenye dataset: {len(todo)} — zimehifadhiwa kwenye {path}", flush=True)
+        return 0
     run_pipeline = load_converter()
-    todo = fetch_missing()
-    random.shuffle(todo)  # zinazoshindwa kila mara zisizuie zingine
-    print(f"Zisizo kwenye dataset: {len(todo)} — nashughulikia hadi {BATCH} sasa.", flush=True)
+    todo = json.loads(Path(TODO_FILE).read_text(encoding="utf-8")) if TODO_FILE and Path(TODO_FILE).exists() else fetch_missing()
+    mine = pick_mine(todo)
+    print(f"Zisizo kwenye dataset: {len(todo)} — shard {SHARD + 1}/{SHARDS} inashughulikia {len(mine)} sasa.", flush=True)
     ok = fail = 0
-    for m in todo[:BATCH]:
+    for m in mine:
         if time.time() - started > BUDGET_MIN * 60:
             print("⏱️ Muda umeisha — zilizobaki zitaendelea run inayofuata.")
             break
@@ -89,7 +123,7 @@ def main():
         else:
             fail += 1
             print("❌ Haikufanikiwa (angalia log hapo juu).", flush=True)
-    print(f"\n🏁 Imekamilika: ✅ {ok}  ❌ {fail}  (zilizobaki: {max(0, len(todo) - ok)})")
+    print(f"\n🏁 Shard {SHARD + 1}/{SHARDS}: ✅ {ok}  ❌ {fail}  (jumla ya zilizokuwa zimebaki: {len(todo)})")
     return 1 if (fail and not ok) else 0
 
 

@@ -2,26 +2,56 @@ name: Drive to MP4 (auto)
 
 on:
   schedule:
-    - cron: "0 */3 * * *"   # kila saa 3
-  workflow_dispatch:         # pia unaweza kuiendesha mwenyewe: Actions -> Run workflow
+    - cron: "17 * * * *"      # kila saa (dakika 17, kuepuka msongamano wa saa kamili)
+  workflow_dispatch:           # pia: Actions -> Run workflow
 
 concurrency:
   group: drive-sync
-  cancel-in-progress: false  # run moja tu kwa wakati
+  cancel-in-progress: false    # run moja tu kwa wakati (nyingine zinasubiri)
 
 jobs:
-  sync:
+  plan:                        # inaorodhesha zisizo kwenye dataset MARA MOJA
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 30
+    outputs:
+      count: ${{ steps.p.outputs.count }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: ffmpeg
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-      - name: Python deps
-        run: pip install -q requests huggingface_hub imageio-ffmpeg
+      - id: p
+        run: python sync.py --plan todo.json
+        env:
+          SYNC_URL: ${{ secrets.SYNC_URL }}
+          SYNC_KEY: ${{ secrets.SYNC_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: todo
+          path: todo.json
+
+  sync:                        # shard 4 zinabadilisha sambamba (kila moja ni mashine yake)
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]    # ongeza/punguza namba hapa kubadili idadi ya mashine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: todo
+      - name: ffmpeg + deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -q requests huggingface_hub imageio-ffmpeg
       - name: Sync
         run: python sync.py
         env:
@@ -29,4 +59,9 @@ jobs:
           SYNC_KEY: ${{ secrets.SYNC_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_REPO: ${{ vars.HF_REPO || 'JAYNESTV/iphone-stream' }}
-          BATCH: ${{ vars.BATCH || '5' }}
+          BATCH: ${{ vars.BATCH || '10' }}      # kwa kila shard (4 x 10 = 40 kwa run)
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ strategy.job-total }}
+          SEED: ${{ github.run_id }}
+          TODO_FILE: todo.json
+          

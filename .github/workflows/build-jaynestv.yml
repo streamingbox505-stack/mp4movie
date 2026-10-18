@@ -1,0 +1,27 @@
+name: Build JaynesTV schedule
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: build-jaynestv
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg && pip install -q huggingface_hub
+      - run: python build_jaynestv.py
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DATA_REPO: ${{ vars.HF_REPO || 'jaynesmaxtv/movie-file' }}
+          TR_URL: ${{ vars.CONTENT_URL || 'https://ooqvsqmsnwjqvuzbhczx.supabase.co' }}/functions/v1/movie-zilizotafsriwa2
+          LOGO_URL: ${{ vars.JAYNESTV_LOGO || '' }}

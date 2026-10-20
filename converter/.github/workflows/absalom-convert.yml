@@ -1,0 +1,44 @@
+name: Absalom converter
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Vipindi vingi zaidi kwa run hii"
+        default: "60"
+      dry_run:
+        description: "1 = orodhesha tu, usipakue"
+        default: "0"
+  # schedule:
+  #   - cron: "0 */6 * * *"   # washa tu ukishajaribu kwa mkono
+
+concurrency:
+  group: absalom-convert
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          pip install -r converter/requirements.txt
+          command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || \
+            (sudo apt-get update && sudo apt-get install -y ffmpeg)
+      - name: Convert
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: jaynesmaxtv/movie-file
+          HF_REPO_TYPE: ${{ vars.HF_REPO_TYPE || 'dataset' }}
+          LIMIT: ${{ inputs.limit || '60' }}
+          DRY_RUN: ${{ inputs.dry_run || '0' }}
+          MAX_RUNTIME_MIN: "320"
+        run: python converter/convert.py
+        

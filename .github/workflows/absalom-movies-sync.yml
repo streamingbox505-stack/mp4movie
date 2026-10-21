@@ -1,0 +1,34 @@
+name: Absalom movies sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 */6 * * *"
+
+concurrency:
+  group: absalom-movies-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Run sync pages until completed
+        env:
+          SYNC_URL: ${{ secrets.ABSALOM_MOVIES_SYNC_URL }}
+          SYNC_KEY: ${{ secrets.ABSALOM_SYNC_KEY }}
+        run: |
+          set -e
+          FROM=1
+          for i in $(seq 1 20); do
+            RESP=$(curl -fsS -X POST "$SYNC_URL?from=$FROM&to=9999" -H "x-sync-key: $SYNC_KEY")
+            echo "$RESP" | head -c 400; echo
+            DONE=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print('1' if d.get('completed') else '0')")
+            if [ "$DONE" = "1" ]; then exit 0; fi
+            FROM=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['next_page'])")
+          done
+          echo "Sync haijakamilika baada ya mizunguko 20"; exit 1

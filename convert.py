@@ -183,6 +183,44 @@ def safe_slug(slug: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9._%-]+", slug)) and not slug.startswith(".") and ".." not in slug
 
 
+def codec_of(path: Path, sel: str):
+    """codec_name ya stream ya kwanza (v:0 au a:0); None ikiwa haipo."""
+    p = run(["ffprobe", "-v", "error", "-select_streams", sel,
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)], timeout=90)
+    if p.returncode != 0:
+        raise RuntimeError(f"ffprobe {sel}: {short(p.stderr)}")
+    out = p.stdout.strip().splitlines()
+    return out[0].strip() if out and out[0].strip() else None
+
+
+def convert_file(src: Path, dst: Path) -> dict:
+    """Video h264 + audio aac -> copy. Video si h264 -> re-encode video na audio.
+    Audio si aac (video h264) -> re-encode audio tu. Inarudisha {'vcodec','acodec','action'}."""
+    vcodec = codec_of(src, "v:0")
+    acodec = codec_of(src, "a:0")
+    if vcodec != "h264":
+        action = "reencode-video"
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src),
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-profile:v", "main",
+               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+               "-movflags", "+faststart", str(dst)]
+    elif acodec not in (None, "aac"):
+        action = "reencode-audio"
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src),
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+               "-movflags", "+faststart", str(dst)]
+    else:
+        action = "copy"
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-c", "copy",
+               "-movflags", "+faststart", str(dst)]
+    p = run(cmd, timeout=5 * 3600)
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg({action}): {short(p.stderr)}")
+    if codec_of(dst, "v:0") != "h264":
+        raise RuntimeError("Baada ya ubadilishaji video bado si h264")
+    return {"vcodec": vcodec, "acodec": acodec, "action": action}
+
+
 def process(ep, tmp: Path):
     """Inapakua na kuthibitisha kipindi kimoja. Haigusi DB (hufanywa na main thread)."""
     post = ep.get("absalom_posts") or {}
@@ -196,11 +234,15 @@ def process(ep, tmp: Path):
         ok, why = verify_mp4(f)
         if not ok:
             raise RuntimeError(why)
-    except Exception as e:  # noqa: BLE001
+        out = tmp / f"{ep['id']}.out.mp4"
+        info = convert_file(f, out)
         f.unlink(missing_ok=True)
+        print(f"  {tag}: video={info['vcodec']} audio={info['acodec']} -> {info['action']}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        for x in (f, tmp / f"{ep['id']}.out.mp4"):
+            x.unlink(missing_ok=True)
         return ep, None, None, str(e)
-    print(f"  verified {tag}", flush=True)
-    return ep, f"videos/absalom/{slug}/{ep['position']}.mp4", f, None
+    return ep, f"videos/absalom/{slug}/{ep['position']}.mp4", out, None
 
 
 def commit_with_retry(api, ops, message: str):

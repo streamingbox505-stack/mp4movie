@@ -79,7 +79,7 @@ def fetch_pending(limit: int):
         # !inner: inachuja kwa slug ya post ikiwa ONLY_SLUGS imewekwa
         "select": "id,wp_id,position,label,drive_id,status,tries,absalom_posts!inner(slug)",
         "or": f"(status.eq.pending,and(status.eq.failed,tries.lt.{MAX_TRIES}))",
-        "order": "wp_id.asc,position.asc",
+        "order": "updated_at.asc,wp_id.asc,position.asc",
         "limit": str(limit),
     }
     if ONLY_SLUGS:
@@ -121,8 +121,8 @@ def mark_retry(ep, reason: str):
 
 
 def is_quota(reason: str) -> bool:
-    r = reason.lower()
-    return "quota" in r or "haikutoa" in r
+    """Kosa la quota la kweli pekee: download yenyewe imeshindwa. HTML ni kesi tofauti (DRIVE_HTML)."""
+    return reason.startswith("DRIVE_QUOTA")
 
 
 def run(cmd, timeout):
@@ -137,7 +137,11 @@ def verify_mp4(path: Path):
     with open(path, "rb") as f:
         head = f.read(12)
     if head[4:8] != b"ftyp":
-        return False, "Si MP4 (hakuna 'ftyp'); huenda Drive imerudisha ukurasa wa quota au ruhusa"
+        with open(path, "rb") as fh:
+            sniff = fh.read(64).lstrip().lower()
+        if sniff.startswith(b"<"):
+            return False, "DRIVE_HTML: Drive ilirudisha ukurasa wa HTML (uthibitisho au ruhusa), si video"
+        return False, "Si MP4 (hakuna 'ftyp')"
     try:
         p = run(
             ["ffprobe", "-v", "error", "-show_entries", "format=format_name,duration:stream=codec_type",
@@ -174,9 +178,9 @@ def verify_mp4(path: Path):
 def download(drive_id: str, dest: Path):
     import gdown
 
-    out = gdown.download(id=drive_id, output=str(dest), quiet=True)
+    out = gdown.download(id=drive_id, output=str(dest), quiet=True, fuzzy=True)
     if not out or not dest.exists():
-        raise RuntimeError("Drive haikutoa faili (ruhusa au quota)")
+        raise RuntimeError("DRIVE_QUOTA: Drive haikutoa faili (ruhusa au quota)")
 
 
 def safe_slug(slug: str) -> bool:

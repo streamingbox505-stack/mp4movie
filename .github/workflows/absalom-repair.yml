@@ -1,0 +1,46 @@
+name: Absalom video repair
+
+on:
+  workflow_dispatch:
+    inputs:
+      prefixes:
+        description: "Folda za kukagua, zimetenganishwa kwa koma (acha tupu kwa default)"
+        default: ""
+      dry_run:
+        description: "1 = orodhesha tu"
+        default: "0"
+
+concurrency:
+  group: absalom-repair
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: converter/requirements.txt
+      - name: Install
+        run: |
+          pip install -r converter/requirements.txt
+          command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || \
+            (sudo apt-get update && sudo apt-get install -y ffmpeg)
+      - name: Repair
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET: ${{ vars.HF_DATASET || 'jaynesmaxtv/movie-file' }}
+          REPAIR_PREFIXES: ${{ inputs.prefixes || '' }}
+          DRY_RUN: ${{ inputs.dry_run || '0' }}
+          MAX_RUNTIME_MIN: "320"
+          MIN_FREE_GB: "5"
+        run: |
+          if [ -z "$REPAIR_PREFIXES" ]; then unset REPAIR_PREFIXES; fi
+          cd converter && python repair.py

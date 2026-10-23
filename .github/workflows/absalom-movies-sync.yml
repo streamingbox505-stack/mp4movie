@@ -24,11 +24,16 @@ jobs:
         run: |
           set -e
           FROM=1
-          for i in $(seq 1 20); do
-            RESP=$(curl -fsS -X POST "$SYNC_URL?from=$FROM&to=9999" -H "x-sync-key: $SYNC_KEY")
+          for i in $(seq 1 60); do
+            RESP=""
+            for attempt in 1 2 3 4 5; do
+              RESP=$(curl -fsS --max-time 170 -X POST "$SYNC_URL?from=$FROM&to=9999" -H "x-sync-key: $SYNC_KEY") && break
+              echo "Jaribio $attempt la ukurasa $FROM limeshindwa; nasubiri..."; sleep $((attempt * 20))
+            done
+            if [ -z "$RESP" ]; then echo "Imeshindwa kabisa kwenye ukurasa $FROM"; exit 1; fi
             echo "$RESP" | head -c 400; echo
             DONE=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print('1' if d.get('completed') else '0')")
             if [ "$DONE" = "1" ]; then exit 0; fi
             FROM=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['next_page'])")
           done
-          echo "Sync haijakamilika baada ya mizunguko 20"; exit 1
+          echo "Sync haijakamilika baada ya mizunguko 60"; exit 1

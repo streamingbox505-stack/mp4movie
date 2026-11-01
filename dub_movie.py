@@ -51,11 +51,18 @@ def download(src, dest):
     return dest
 
 
+def load_wav(path):
+    """Soma wav ya 16kHz mono kama safu ya float32 (Whisper inaipokea moja kwa moja, bila kutegemea maktaba ya av)."""
+    with wave.open(path, "rb") as w:
+        assert w.getframerate() == SR and w.getnchannels() == 1 and w.getsampwidth() == 2, "asr.wav si 16kHz mono 16-bit"
+        return np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768.0
+
+
 # ---------- hatua za AI (zinapakia models kwa uvivu) ----------
 def transcribe(wav):
     from faster_whisper import WhisperModel
     model = WhisperModel(WHISPER, device="cpu", compute_type="int8")
-    segs, info = model.transcribe(wav, language=SRC_LANG, vad_filter=True, beam_size=1, condition_on_previous_text=False)
+    segs, info = model.transcribe(load_wav(wav), language=SRC_LANG, vad_filter=True, beam_size=1, condition_on_previous_text=False)
     out, last = [], 0
     for s in segs:
         t = s.text.strip()

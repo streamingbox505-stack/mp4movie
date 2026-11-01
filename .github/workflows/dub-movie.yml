@@ -1,0 +1,71 @@
+name: Dub movie (Kiswahili)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL ya mp4 ya filamu (mf. https://huggingface.co/datasets/jaynesmaxtv/movie-file/resolve/main/videos/FAILI.mp4)"
+        required: true
+      name:
+        description: "Jina la matokeo, bila nafasi (mf. brothers-under-fire)"
+        required: true
+      src_lang:
+        description: "Lugha ya asili (en, fr, es...). Acha tupu = itatambuliwa yenyewe"
+        required: false
+      bg_volume:
+        description: "Sauti ya asili (muziki/kelele) 0.0 - 1.0"
+        required: false
+        default: "0.25"
+      keep_original:
+        description: "Weka pia sauti ya asili kama track ya pili"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dub-${{ inputs.name }}
+  cancel-in-progress: false
+
+jobs:
+  dub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350          # kikomo cha GitHub ni saa 6 kwa job
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Hifadhi models (zisipakuliwe kila mara)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-dub-models-v1
+      - name: Weka zana
+        run: |
+          pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -q faster-whisper transformers sentencepiece numpy huggingface_hub
+      - name: Fanya dubbing
+        run: python dub_movie.py
+        env:
+          SRC_URL: ${{ inputs.url }}
+          NAME: ${{ inputs.name }}
+          SRC_LANG: ${{ inputs.src_lang }}
+          BG_VOLUME: ${{ inputs.bg_volume }}
+          KEEP_ORIGINAL: ${{ inputs.keep_original && '1' || '0' }}
+          WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'small' }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DUB_REPO: ${{ vars.DUB_REPO || 'jaynesmaxtv/movie-file' }}
+          DUB_PREFIX: ${{ vars.DUB_PREFIX || 'dubbed/' }}
+      - name: Hifadhi faili za ukaguzi (maandishi, tafsiri, manukuu)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dub-${{ inputs.name }}
+          path: |
+            work/segments.json
+            work/sw.json
+            work/*.vtt
+          if-no-files-found: ignore

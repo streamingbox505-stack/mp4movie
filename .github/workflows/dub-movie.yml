@@ -12,6 +12,20 @@ on:
       src_lang:
         description: "Lugha ya asili (en, fr, es...). Acha tupu = itatambuliwa yenyewe"
         required: false
+      subtitle_url:
+        description: "Manukuu ya asili (URL ya .srt au .vtt) unayoruhusiwa kuyatumia. Tupu = tafuta subs/<name>.srt kwenye repo"
+        required: false
+      sub_lang:
+        description: "Lugha ya manukuu hayo (en, fr...)"
+        required: false
+        default: "en"
+      audio_track:
+        description: "Namba ya sauti ya asili kwenye faili (0 = ya kwanza; kwa faili zenye sauti nyingi chagua ya lugha ya asili)"
+        required: false
+        default: "0"
+      prompt:
+        description: "Majina ya wahusika/maneno magumu, yakitenganishwa kwa koma (yanasaidia Whisper kuandika majina sawasawa)"
+        required: false
       separate:
         description: "Ondoa sauti ya waigizaji wa asili kwa Demucs (dubbing ya kweli; nzito, saa kadhaa). Zima = voice-over tu"
         type: boolean
@@ -64,8 +78,17 @@ jobs:
           SRC_LANG: ${{ inputs.src_lang }}
           BG_VOLUME: ${{ inputs.bg_volume }}
           SEPARATE: ${{ inputs.separate && '1' || '0' }}
-          VOICE_F: ${{ vars.VOICE_F }}            # repo ya sauti ya kike (muundo wa MMS/VITS); tupu = facebook/mms-tts-swh
-          VOICE_M: ${{ vars.VOICE_M }}            # repo ya sauti ya kiume
+          SUBTITLE_URL: ${{ inputs.subtitle_url }}
+          SUB_LANG: ${{ inputs.sub_lang }}
+          AUDIO_TRACK: ${{ inputs.audio_track }}
+          PROMPT: ${{ inputs.prompt }}
+          VOICES_F: ${{ vars.VOICES_F }}          # repo za sauti za kike, zikitenganishwa kwa koma (muundo wa MMS/VITS); tupu = facebook/mms-tts-swh
+          VOICES_M: ${{ vars.VOICES_M }}          # repo za sauti za kiume (jumla ya sauti zote hadi sita)
+          DIARIZE: ${{ vars.DIARIZE || '1' }}     # tambua wazungumzaji
+          SPK_THRESHOLD: ${{ vars.SPK_THRESHOLD || '0.35' }}
+          EMOTION: ${{ vars.EMOTION || '1' }}     # tambua hisia
+          CONDENSE: ${{ vars.CONDENSE || '1' }}   # fupisha mistari mirefu kwa kuzungumzwa
+          WHISPER_BEAM: ${{ vars.WHISPER_BEAM || '3' }}
           PITCH_F: ${{ vars.PITCH_F || '1.5' }}
           PITCH_M: ${{ vars.PITCH_M || '-2.5' }}
           GENDER_SPLIT: ${{ vars.GENDER_SPLIT || '165' }}
@@ -73,10 +96,18 @@ jobs:
           BG_SEP: ${{ vars.BG_SEP || '0.9' }}
           VOICE_GAIN: ${{ vars.VOICE_GAIN || '1.0' }}
           KEEP_ORIGINAL: ${{ inputs.keep_original && '1' || '0' }}
-          WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'small' }}
+          WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'medium' }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           DUB_REPO: ${{ vars.DUB_REPO || 'jaynesmaxtv/movie-file' }}
           DUB_PREFIX: ${{ vars.DUB_PREFIX || 'dubbed/' }}
+      - name: Ripoti ya usahihi wa Whisper (inafanya kazi tu kukiwa na manukuu ya asili)
+        if: always()
+        continue-on-error: true
+        run: |
+          SUB=""
+          [ -f work/sub.txt ] && SUB=work/sub.txt
+          [ -z "$SUB" ] && [ -f "subs/${{ inputs.name }}.srt" ] && SUB="subs/${{ inputs.name }}.srt"
+          if [ -n "$SUB" ] && [ -f work/segments.json ]; then python compare_subs.py work/segments.json "$SUB" | tee -a "$GITHUB_STEP_SUMMARY"; fi
       - name: Hifadhi faili za ukaguzi (maandishi, tafsiri, manukuu)
         if: always()
         uses: actions/upload-artifact@v4
@@ -86,5 +117,7 @@ jobs:
             work/segments.json
             work/sw.json
             work/*.vtt
+            work/quality.json
+            work/quality.txt
+            work/sub_match.json
           if-no-files-found: ignore
-          

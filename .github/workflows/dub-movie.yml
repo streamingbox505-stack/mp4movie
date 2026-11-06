@@ -41,14 +41,23 @@ on:
       clone:
         description: "Cloning (majaribio): kila mwigizaji aongee Kiswahili kwa sauti yake (Chatterbox). Nzito kwenye CPU; weka clip_min kujaribu kwanza"
         type: boolean
-        default: false
+        default: true
       clip_min:
         description: "Kujaribu haraka: shughulikia dakika N za kwanza tu (mf. 8). 0 = filamu nzima"
         required: false
         default: "0"
+      then_compress:
+        description: "Baada ya dub, anzisha compress ya mp4 mpya (punguza ukubwa)"
+        type: boolean
+        default: true
+      compress_mb:
+        description: "Ukubwa unaolengwa wa compress kwa MB"
+        required: false
+        default: "600"
 
 permissions:
   contents: read
+  actions: write        # inahitajika kwa then_compress
 
 concurrency:
   group: dub-${{ inputs.name }}
@@ -84,6 +93,7 @@ jobs:
           pip install -q chatterbox-tts --extra-index-url https://download.pytorch.org/whl/cpu
           python -c "import torch, numpy, transformers, faster_whisper; from chatterbox.mtl_tts import ChatterboxMultilingualTTS; print('torch', torch.__version__, '| numpy', numpy.__version__, '| transformers', transformers.__version__)"
       - name: Fanya dubbing
+        id: run
         run: python dub_movie.py
         env:
           SRC_URL: ${{ inputs.url }}
@@ -139,4 +149,11 @@ jobs:
             work/sub_match.json
             work/ref_spk*.wav
           if-no-files-found: ignore
-          
+      - name: Anzisha compress (hiari)
+        if: ${{ inputs.then_compress && steps.run.outputs.url != '' }}
+        run: gh workflow run compress-movie.yml -f url="$NEW_URL" -f name="$NEW_NAME" -f target_mb="$TARGET_MB"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_URL: ${{ steps.run.outputs.url }}
+          NEW_NAME: ${{ steps.run.outputs.name }}
+          TARGET_MB: ${{ inputs.compress_mb }}

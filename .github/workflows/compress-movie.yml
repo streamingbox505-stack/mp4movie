@@ -1,0 +1,89 @@
+name: Compress movie (punguza ukubwa)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL ya mp4 ya filamu (mf. https://huggingface.co/datasets/jaynesmaxtv/movie-file/resolve/main/videos/FAILI.mp4)"
+        required: true
+      name:
+        description: "Jina la matokeo, bila nafasi (mf. dhurandhar-the-revenge-2026)"
+        required: true
+      target_mb:
+        description: "Ukubwa unaolengwa kwa MB (mf. 600). Filamu ya saa 2 kwa 600 MB inafaa 480p"
+        required: false
+        default: "600"
+      height:
+        description: "Urefu wa picha: auto (inachagua yenyewe), 0 (usibadilishe), au 1080/720/576/480/360"
+        required: false
+        default: "auto"
+      codec:
+        description: "h264 (inacheza kila mahali) au h265 (ndogo zaidi, lakini polepole sana kwenye CPU na haichezi kila browser)"
+        type: choice
+        options: [h264, h265]
+        default: h264
+      preset:
+        description: "Kasi ya encoder: veryfast (haraka, ubora wa chini) ... slow (polepole, ubora zaidi)"
+        type: choice
+        options: [veryfast, faster, fast, medium, slow]
+        default: fast
+      two_pass:
+        description: "2-pass: ukubwa sahihi zaidi, lakini inachukua karibu mara mbili ya muda"
+        type: boolean
+        default: true
+      audio_kbps:
+        description: "Ubora wa sauti (kbps)"
+        required: false
+        default: "96"
+      audio_track:
+        description: "Namba ya sauti ya kutumia (0 = ya kwanza)"
+        required: false
+        default: "0"
+      then_dub:
+        description: "Baada ya kupunguza, anzisha dub ya Kiswahili kwa faili hiyo mpya"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write        # inahitajika kwa then_dub
+
+concurrency:
+  group: compress-${{ inputs.name }}
+  cancel-in-progress: false
+
+jobs:
+  compress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350          # kikomo cha GitHub ni saa 6 kwa job
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - run: pip install -q huggingface_hub
+      - name: Punguza ukubwa
+        id: run
+        run: python compress_movie.py
+        env:
+          SRC_URL: ${{ inputs.url }}
+          NAME: ${{ inputs.name }}
+          TARGET_MB: ${{ inputs.target_mb }}
+          HEIGHT: ${{ inputs.height }}
+          CODEC: ${{ inputs.codec }}
+          PRESET: ${{ inputs.preset }}
+          TWO_PASS: ${{ inputs.two_pass && '1' || '0' }}
+          AUDIO_KBPS: ${{ inputs.audio_kbps }}
+          AUDIO_TRACK: ${{ inputs.audio_track }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DUB_REPO: ${{ vars.DUB_REPO || 'jaynesmaxtv/movie-file' }}
+          COMPRESS_PREFIX: ${{ vars.COMPRESS_PREFIX || 'compressed/' }}
+      - name: Anzisha dub (hiari)
+        if: ${{ inputs.then_dub && steps.run.outputs.url != '' }}
+        run: gh workflow run dub-movie.yml -f url="$NEW_URL" -f name="$NAME"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_URL: ${{ steps.run.outputs.url }}
+          NAME: ${{ inputs.name }}
+          

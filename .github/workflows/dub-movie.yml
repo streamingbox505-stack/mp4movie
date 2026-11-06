@@ -38,10 +38,6 @@ on:
         description: "Weka pia sauti ya asili kama track ya pili"
         type: boolean
         default: false
-      clone:
-        description: "Cloning (majaribio): kila mwigizaji aongee Kiswahili kwa sauti yake (Chatterbox). Nzito kwenye CPU; weka clip_min kujaribu kwanza"
-        type: boolean
-        default: true
       clip_min:
         description: "Kujaribu haraka: shughulikia dakika N za kwanza tu (mf. 8). 0 = filamu nzima"
         required: false
@@ -71,7 +67,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ inputs.clone && '3.11' || '3.12' }}   # chatterbox-tts imejaribiwa kwenye 3.11
+          python-version: "3.11"   # chatterbox-tts imejaribiwa kwenye 3.11
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
       - name: Hifadhi models (zisipakuliwe kila mara)
         uses: actions/cache@v4
@@ -79,7 +75,7 @@ jobs:
           path: |
             ~/.cache/huggingface
             ~/.cache/torch
-          key: hf-dub-models-${{ inputs.clone && 'clone-' || '' }}v1     # cloning inapakua models za ziada (~3 GB), kwa hiyo cache yake ni tofauti
+          key: hf-dub-models-clone-v1     # cloning inapakua models za ziada (~3 GB)
       - name: Weka zana
         run: |
           pip install -q torch --index-url https://download.pytorch.org/whl/cpu
@@ -88,7 +84,6 @@ jobs:
           pip install -q --no-deps demucs
           pip install -q julius einops pyyaml tqdm dora-search openunmix treetable lameenc
       - name: Weka Chatterbox (cloning)
-        if: ${{ inputs.clone }}
         run: |
           pip install -q chatterbox-tts --extra-index-url https://download.pytorch.org/whl/cpu
           python -c "import torch, numpy, transformers, faster_whisper; from chatterbox.mtl_tts import ChatterboxMultilingualTTS; print('torch', torch.__version__, '| numpy', numpy.__version__, '| transformers', transformers.__version__)"
@@ -119,7 +114,7 @@ jobs:
           BG_SEP: ${{ vars.BG_SEP || '0.9' }}
           VOICE_GAIN: ${{ vars.VOICE_GAIN || '1.0' }}
           KEEP_ORIGINAL: ${{ inputs.keep_original && '1' || '0' }}
-          CLONE: ${{ inputs.clone && '1' || '0' }}
+          CLONE: "1"      # cloning imewashwa moja kwa moja
           CLIP_MIN: ${{ inputs.clip_min }}
           CLONE_DEADLINE_MIN: ${{ vars.CLONE_DEADLINE_MIN || '250' }}   # baada ya dakika hizi tangu kuanza, mistari iliyobaki inatumia MMS
           CLONE_CFG: ${{ vars.CLONE_CFG || '0.5' }}

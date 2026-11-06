@@ -503,7 +503,9 @@ def f0_median(x):
         ac = np.fft.irfft(np.abs(np.fft.rfft(row * win, 2 * fr)) ** 2)[:fr]
         ac = ac / (ac[0] + 1e-9)
         seg = ac[lo:hi]
-        k = lo + int(np.where(seg >= 0.9 * seg.max())[0][0])
+        if len(seg) == 0 or not np.isfinite(seg).all():      # NaN au sehemu tupu: ruka fremu hii
+            continue
+        k = lo + int(np.argmax(seg >= seg.max() - 0.1 * abs(seg.max())))      # kilele cha kwanza karibu na cha juu (inafaa hata thamani zikiwa hasi)
         if ac[k] > 0.45:
             f.append(SR / k)
     return float(np.median(f)) if len(f) >= 4 else None
@@ -781,7 +783,10 @@ def main():
     for f in (f"{NAME}-sw.mp4", f"{NAME}-sw.vtt"):
         api.upload_file(path_or_fileobj=f"{WORK}/{f}", path_in_repo=f"{PREFIX}{f}", repo_id=DUB_REPO, repo_type="dataset")
     api.upload_file(path_or_fileobj=f"{WORK}/sw.json", path_in_repo=f"{PREFIX}{NAME}-sw.json", repo_id=DUB_REPO, repo_type="dataset")
-    log(f"📦 https://huggingface.co/datasets/{DUB_REPO}/resolve/main/{PREFIX}{NAME}-sw.mp4")
+    url = f"https://huggingface.co/datasets/{DUB_REPO}/resolve/main/{PREFIX}{NAME}-sw.mp4"
+    log(f"📦 {url}")
+    if E("GITHUB_OUTPUT"):                                      # kwa hatua ya compress inayofuata
+        open(E("GITHUB_OUTPUT"), "a").write(f"url={url}\nname={NAME}-sw\n")
 
 
 if __name__ == "__main__":

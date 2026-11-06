@@ -23,6 +23,11 @@ Env: SRC_URL (au njia ya faili), NAME, SRC_LANG (hiari), WHISPER_MODEL (medium),
      PITCH_F (1.5), PITCH_M (-2.5)  semitones za msingi ili sauti zitofautiane hata kama modeli ni moja
      GENDER_SPLIT (165) Hz: pitch juu ya hii = kike;  EXPRESSIVE (1) = hamisha sauti kubwa/ndogo na pitch ya asili;  VOICE_GAIN (1.0)
      HF_TOKEN, DUB_REPO (jaynesmaxtv/movie-file), DUB_PREFIX (dubbed/), SKIP_UPLOAD (0/1)
+
+CLONING (majaribio): CLONE=1 -> kila mzungumzaji wa asili hupata sauti yake kwa Kiswahili (Chatterbox Multilingual, zero-shot, leseni MIT).
+     Marejeo ya sekunde ~9 huchukuliwa kutoka kwenye sauti safi ya Demucs (work/ref_spk*.wav). Mistari inayoshindwa, au inayozidi muda
+     (CLONE_DEADLINE_MIN, 250 dk tangu kuanza), hutumia MMS kama kawaida. CLONE_CFG (0.5) = uzito wa CFG. Inahitaji: pip install chatterbox-tts
+     CLIP_MIN=N -> shughulikia dakika N za kwanza tu za filamu (kwa kujaribu haraka)
 """
 import json, os, re, shutil, subprocess, sys, time, urllib.request, wave
 import numpy as np
@@ -37,6 +42,8 @@ CONDENSE, CONDENSE_RATIO, LLM_REPO = E("CONDENSE", "1") == "1", float(E("CONDENS
 DIARIZE, SPK_THR, SPK_REPO = E("DIARIZE", "1") == "1", float(E("SPK_THRESHOLD", "0.35")), "microsoft/wavlm-base-plus-sv"
 EMOTION, EMO_REPO = E("EMOTION", "1") == "1", "superb/wav2vec2-base-superb-er"
 KEEP_ORIG = E("KEEP_ORIGINAL", "0") == "1"
+CLONE, CLONE_DEADLINE, CLONE_CFG, CLIP_MIN, T0 = E("CLONE", "0") == "1", float(E("CLONE_DEADLINE_MIN", "250") or 250), float(E("CLONE_CFG", "0.5") or 0.5), float(E("CLIP_MIN", "0") or 0), time.time()
+EXAG = {"neu": 0.5, "hap": 0.6, "ang": 0.8, "sad": 0.35}       # 'exaggeration' ya Chatterbox kulingana na hisia
 TOKEN, DUB_REPO, PREFIX = E("HF_TOKEN", "").strip(), E("DUB_REPO", "jaynesmaxtv/movie-file"), E("DUB_PREFIX", "dubbed/")
 NLLB, TTS_MODEL, WORK, SR = "facebook/nllb-200-distilled-600M", "facebook/mms-tts-swh", E("WORK_DIR", "work"), 16000
 SEPARATE, BG_SEP, VOICE_GAIN = E("SEPARATE", "1") == "1", float(E("BG_SEP", "0.9")), float(E("VOICE_GAIN", "1.0"))
@@ -264,6 +271,112 @@ class Voice:
         return w if self.sr == SR else np.interp(np.linspace(0, len(w) - 1, int(len(w) * SR / self.sr)), np.arange(len(w)), w).astype(np.float32)
 
 
+# ---------- cloning: sauti ya kila mwigizaji kwa Kiswahili (Chatterbox Multilingual) ----------
+def trim_sil(a, thr=0.02):
+    """Ondoa ukimya mwanzoni/mwishoni mwa sentensi ili muda ulingane na ratiba."""
+    idx = np.where(np.abs(a) > thr * (float(np.abs(a).max()) or 1.0))[0] if len(a) else []
+    return a[max(0, idx[0] - int(0.03 * SR)):idx[-1] + int(0.08 * SR)] if len(idx) else a
+
+
+class Cloner:
+    def __init__(self, refs=None):
+        import torch
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        _ld = torch.load
+        if dev == "cpu":                              # checkpoints zimehifadhiwa kwa CUDA: zipakie kwenye CPU
+            torch.load = lambda *a, **k: _ld(*a, **{**k, "map_location": torch.device("cpu")})
+        try:
+            from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+            self.m = ChatterboxMultilingualTTS.from_pretrained(device=dev)
+        finally:
+            torch.load = _ld
+        torch.set_num_threads(os.cpu_count() or 2)
+        self.torch, self.refs, self.conds, self.sr, self.n, self.t, self.off, self.dev = torch, refs or {}, {}, int(self.m.sr), 0, 0.0, False, dev
+
+    def selftest(self):
+        """Jaribio la haraka mwanzoni (kabla ya Demucs) ili kushindwa kujulikane mapema, si baada ya saa kadhaa."""
+        if getattr(self.m, "conds", None) is None:
+            return f"modeli imepakiwa ({self.dev}); hakuna sauti ya msingi ya kujaribu"
+        t0 = time.time()
+        w = self.m.generate("Habari, karibu sana.", language_id="sw").squeeze().cpu().numpy()
+        return f"modeli imepakiwa ({self.dev}); sentensi fupi: {len(w) / self.sr:.1f}s ya sauti kwa {time.time() - t0:.1f}s"
+
+    def resample(self, w):
+        try:
+            import torchaudio
+            return torchaudio.functional.resample(self.torch.from_numpy(w)[None], self.sr, SR)[0].numpy().astype(np.float32)
+        except Exception:
+            return np.interp(np.linspace(0, len(w) - 1, int(len(w) * SR / self.sr)), np.arange(len(w)), w).astype(np.float32)
+
+    def _prep(self, s):
+        if s not in self.conds:
+            try:
+                self.m.prepare_conditionals(self.refs[s], exaggeration=0.5)
+                self.conds[s] = self.m.conds
+            except Exception as e:                    # njia ya polepole: marejeo yanatolewa kila sentensi
+                log(f"⚠️ cloning: njia ya haraka haikufaa kwa mzungumzaji {s} ({str(e)[:120]}); nitatumia audio_prompt_path")
+                self.conds[s] = None
+        return self.conds[s]
+
+    def __call__(self, s, text, ex=0.5):
+        if self.off or time.time() - T0 > CLONE_DEADLINE * 60:
+            if not self.off:
+                log("⏱ Muda wa cloning umeisha; mistari iliyobaki itatumia sauti za MMS")
+            self.off = True
+            return None
+        t0, cd, kw = time.time(), self._prep(s), {}
+        if cd is not None:
+            self.m.conds = cd
+        else:
+            kw["audio_prompt_path"] = self.refs[s]
+        chunks = []
+        for p in [p.strip() for p in re.split(r"(?<=[.!?;:])\s+", text) if p.strip()]:
+            while len(p) > 220:                       # vipande virefu: kata kwenye nafasi
+                cut = p.rfind(" ", 0, 220)
+                cut = cut if cut > 0 else 220
+                chunks.append(p[:cut]); p = p[cut:].strip()
+            chunks.append(p)
+        wavs = []
+        for c in chunks:
+            try:
+                with self.torch.inference_mode():
+                    w = self.m.generate(c, language_id="sw", exaggeration=ex, cfg_weight=CLONE_CFG, **kw).squeeze().cpu().numpy().astype(np.float32)
+                wavs += [trim_sil(self.resample(w)), np.zeros(int(0.12 * SR), np.float32)]
+            except Exception as e:
+                if self.n < 5:
+                    log(f"⚠️ cloning: kipande kimeshindwa ({str(e)[:160]})")
+        self.n, self.t = self.n + 1, self.t + time.time() - t0
+        if self.n % 50 == 0:
+            log(f"  … cloning: mistari {self.n}, wastani {self.t / self.n:.1f}s kwa mstari ({(time.time() - T0) / 60:.0f} dk tangu kuanza)")
+        return np.concatenate(wavs[:-1]) if wavs else None
+
+
+def build_refs(clips, spk, rms, emo, n, target=9.0):
+    """Marejeo ya sauti ya kila mzungumzaji (~9s): vipande vya wazi, vya kawaida (si kelele wala kupiga kelele), kutoka kwenye sauti safi."""
+    refs = {}
+    for c in sorted(set(spk)):
+        idx = [k for k in range(n) if spk[k] == c and clips[k] is not None and len(clips[k]) >= 2 * SR]
+        if not idx:
+            idx = [k for k in range(n) if spk[k] == c and clips[k] is not None and len(clips[k]) >= int(1.2 * SR)]
+        if not idx:
+            continue
+        neu = [k for k in idx if emo[k] == "neu"]
+        idx = neu if len(neu) >= 2 else idx
+        med = float(np.median([rms[k] for k in idx]))
+        idx.sort(key=lambda k: abs(float(np.log((rms[k] + 1e-6) / (med + 1e-6)))))
+        parts, tot = [], 0.0
+        for k in idx:
+            parts += [clips[k], np.zeros(int(0.2 * SR), np.float32)]
+            tot += len(clips[k]) / SR + 0.2
+            if tot >= target:
+                break
+        if tot < 1.5:
+            continue
+        refs[c] = f"{WORK}/ref_spk{c}.wav"
+        write_wav(np.concatenate(parts[:-1]), refs[c])
+    return refs
+
+
 # ---------- wazungumzaji (diarization) na hisia ----------
 def speaker_embeddings(clips):
     """clips = [safu ya sauti 16kHz]; inarudisha safu ya embeddings (WavLM x-vector) au None kwa clip fupi mno."""
@@ -477,7 +590,19 @@ def main():
     if not SRC:
         sys.exit("SRC_URL haipo")
     os.makedirs(WORK, exist_ok=True)
+    if CLONE:                                          # kushindwa mapema badala ya baada ya saa kadhaa za Demucs
+        try:
+            ct = Cloner()
+            log("🧬 Cloning: " + ct.selftest())
+            del ct
+            import gc; gc.collect()
+        except Exception as e:
+            sys.exit(f"⛔ Cloning haiwezi kuanza: {str(e)[:400]}. Rekebisha usakinishaji wa chatterbox-tts, au weka CLONE=0.")
     src = download(SRC, f"{WORK}/source.mp4")
+    if CLIP_MIN > 0:                                   # jaribio la haraka: dakika za kwanza tu
+        run(["ffmpeg", "-y", "-v", "error", "-i", src, "-t", str(CLIP_MIN * 60), "-c", "copy", f"{WORK}/clip.mp4"])
+        src = f"{WORK}/clip.mp4"
+        log(f"✂️ CLIP_MIN={CLIP_MIN:g}: nashughulikia dakika {CLIP_MIN:g} za kwanza tu")
     total = float(probe(src))
     log(f"▶️ {NAME}: {total / 60:.1f} dk | kutenganisha sauti: {'ndiyo' if SEPARATE else 'hapana (voice-over)'} | Whisper: {WHISPER}")
     cues = load_subtitle()
@@ -561,7 +686,15 @@ def main():
         + ", ".join(f"{k} {emo.count(k)}" for k in EMO_FX))
 
     # --- kutengeneza sauti ---
-    voices = {}
+    voices, cloner = {}, None
+    if CLONE:
+        try:
+            refs = build_refs(clips, spk, rms, emo, n)
+            log(f"🧬 Cloning: marejeo ya sauti {len(refs)}/{len(sizes)} wazungumzaji" + ("" if SEPARATE else " (SEPARATE imezimwa: marejeo yana muziki/kelele, ubora utashuka)"))
+            if refs:
+                cloner = Cloner(refs)
+        except Exception as e:
+            log(f"⚠️ Cloning imeshindwa kuanza ({str(e)[:300]}). Nitatumia sauti za MMS.")
 
     def voice_for(g, vi):
         repo = VOICES[g][vi]
@@ -570,6 +703,11 @@ def main():
         return voices[repo]
 
     def synth(i, text):
+        if cloner is not None and spk[i] in cloner.refs:                       # sauti ya mwigizaji mwenyewe; MMS ikishindwa
+            a = cloner(spk[i], text, EXAG[emo[i]] if EMOTION else 0.5)
+            if a is not None and len(a):
+                a = a / (float(np.sqrt(np.mean(a ** 2))) + 1e-9) * 0.1 * (EMO_FX[emo[i]]["gain"] if EMOTION else 1.0)
+                return a * float(np.clip((rms[i] / med_rms) ** 0.8, 0.5, 2.0)) if EXPRESSIVE and rms[i] > 0 else a     # pitch haibadilishwi: sauti inabaki ya mwigizaji
         g, vi, extra = vmap[spk[i]]
         e = EMO_FX[emo[i]] if EMOTION else EMO_FX["neu"]
         a = voice_for(g, vi)(text, rate=e["rate"])
@@ -591,6 +729,8 @@ def main():
         aud.append(synth(i, say[i]))
         if i % 100 == 0:
             log(f"  … sauti {i}/{n}")
+    if cloner is not None:
+        log(f"🧬 Cloning: mistari {cloner.n} ilijaribiwa, wastani {cloner.t / max(cloner.n, 1):.1f}s kwa mstari" + (" (muda uliisha, zilizobaki ni MMS)" if cloner.off else ""))
     avail = [max(segs[i]["end"] - segs[i]["start"], (segs[i + 1]["start"] if i + 1 < n else total) - segs[i]["start"] - 0.15, 0.3) for i in range(n)]
     need = [i for i in range(n) if aud[i] is not None and len(aud[i]) / SR / avail[i] > CONDENSE_RATIO]
     if CONDENSE and need:

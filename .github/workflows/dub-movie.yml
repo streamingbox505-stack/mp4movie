@@ -39,9 +39,9 @@ on:
         type: boolean
         default: false
       clone:
-        description: "Cloning (majaribio): kila mwigizaji aongee Kiswahili kwa sauti yake (Chatterbox). Nzito kwenye CPU; weka clip_min kujaribu kwanza"
+        description: "Cloning: kila mwigizaji aongee Kiswahili kwa sauti yake (Chatterbox). Imewashwa yenyewe; izime kutumia MMS. Nzito kwenye CPU"
         type: boolean
-        default: false
+        default: true
       clip_min:
         description: "Kujaribu haraka: shughulikia dakika N za kwanza tu (mf. 8). 0 = filamu nzima"
         required: false
@@ -154,4 +154,3 @@ jobs:
             work/ref_spk*.wav
             work/voices/*
           if-no-files-found: ignore
-          

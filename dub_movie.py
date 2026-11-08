@@ -26,7 +26,7 @@ Env: SRC_URL (au njia ya faili), NAME, SRC_LANG (hiari), WHISPER_MODEL (medium),
 
 CLONING (majaribio): CLONE=1 -> kila mzungumzaji wa asili hupata sauti yake kwa Kiswahili (Chatterbox Multilingual, zero-shot, leseni MIT).
      Marejeo ya sekunde ~9 huchukuliwa kutoka kwenye sauti safi ya Demucs (work/ref_spk*.wav). Mistari inayoshindwa, au inayozidi muda
-     (CLONE_DEADLINE_MIN, 250 dk tangu kuanza), hutumia MMS kama kawaida. CLONE_CFG (0.5) = uzito wa CFG. Inahitaji: pip install chatterbox-tts
+     (CLONE_DEADLINE_MIN, 250 dk tangu kuanza) hubaki kimya (CLONE_STRICT=1, msingi) au hutumia MMS (CLONE_STRICT=0). Sauti za wahusika huhifadhiwa kwenye voices/<NAME>/. CLONE_CFG (0.5) = uzito wa CFG. Inahitaji: pip install chatterbox-tts
      CLIP_MIN=N -> shughulikia dakika N za kwanza tu za filamu (kwa kujaribu haraka)
 """
 import json, os, re, shutil, subprocess, sys, time, urllib.request, wave
@@ -43,6 +43,7 @@ DIARIZE, SPK_THR, SPK_REPO = E("DIARIZE", "1") == "1", float(E("SPK_THRESHOLD", 
 EMOTION, EMO_REPO = E("EMOTION", "1") == "1", "superb/wav2vec2-base-superb-er"
 KEEP_ORIG = E("KEEP_ORIGINAL", "0") == "1"
 CLONE, CLONE_DEADLINE, CLONE_CFG, CLIP_MIN, T0 = E("CLONE", "0") == "1", float(E("CLONE_DEADLINE_MIN", "250") or 250), float(E("CLONE_CFG", "0.5") or 0.5), float(E("CLIP_MIN", "0") or 0), time.time()
+STRICT, VOICES_PFX = E("CLONE_STRICT", "1") == "1", E("VOICES_PREFIX", "voices/")     # STRICT: cloning pekee, bila MMS (mstari uliokosa unabaki kimya)
 EXAG = {"neu": 0.5, "hap": 0.6, "ang": 0.8, "sad": 0.35}       # 'exaggeration' ya Chatterbox kulingana na hisia
 TOKEN, DUB_REPO, PREFIX = E("HF_TOKEN", "").strip(), E("DUB_REPO", "jaynesmaxtv/movie-file"), E("DUB_PREFIX", "dubbed/")
 NLLB, TTS_MODEL, WORK, SR = "facebook/nllb-200-distilled-600M", "facebook/mms-tts-swh", E("WORK_DIR", "work"), 16000
@@ -292,6 +293,7 @@ class Cloner:
             torch.load = _ld
         torch.set_num_threads(os.cpu_count() or 2)
         self.torch, self.refs, self.conds, self.sr, self.n, self.t, self.off, self.dev = torch, refs or {}, {}, int(self.m.sr), 0, 0.0, False, dev
+        self.fail = 0
 
     def selftest(self):
         """Jaribio la haraka mwanzoni (kabla ya Demucs) ili kushindwa kujulikane mapema, si baada ya saa kadhaa."""
@@ -321,7 +323,7 @@ class Cloner:
     def __call__(self, s, text, ex=0.5):
         if self.off or time.time() - T0 > CLONE_DEADLINE * 60:
             if not self.off:
-                log("⏱ Muda wa cloning umeisha; mistari iliyobaki itatumia sauti za MMS")
+                log("⏱ Muda wa cloning umeisha; mistari iliyobaki " + ("itabaki kimya (CLONE_STRICT)" if STRICT else "itatumia sauti za MMS"))
             self.off = True
             return None
         t0, cd, kw = time.time(), self._prep(s), {}
@@ -338,17 +340,35 @@ class Cloner:
             chunks.append(p)
         wavs = []
         for c in chunks:
-            try:
-                with self.torch.inference_mode():
-                    w = self.m.generate(c, language_id="sw", exaggeration=ex, cfg_weight=CLONE_CFG, **kw).squeeze().cpu().numpy().astype(np.float32)
-                wavs += [trim_sil(self.resample(w)), np.zeros(int(0.12 * SR), np.float32)]
-            except Exception as e:
-                if self.n < 5:
-                    log(f"⚠️ cloning: kipande kimeshindwa ({str(e)[:160]})")
+            for ex2, cw in ((ex, CLONE_CFG), (0.5, 0.3)):             # jaribio la pili kwa mipangilio laini kabla ya kukata tamaa
+                try:
+                    with self.torch.inference_mode():
+                        w = self.m.generate(c, language_id="sw", exaggeration=ex2, cfg_weight=cw, **kw).squeeze().cpu().numpy().astype(np.float32)
+                    if len(w) > int(0.12 * self.sr):
+                        wavs += [trim_sil(self.resample(w)), np.zeros(int(0.12 * SR), np.float32)]
+                        break
+                except Exception as e:
+                    if self.fail < 5:
+                        log(f"⚠️ cloning: kipande kimeshindwa ({str(e)[:160]})")
+            else:
+                self.fail += 1
         self.n, self.t = self.n + 1, self.t + time.time() - t0
         if self.n % 50 == 0:
             log(f"  … cloning: mistari {self.n}, wastani {self.t / self.n:.1f}s kwa mstari ({(time.time() - T0) / 60:.0f} dk tangu kuanza)")
         return np.concatenate(wavs[:-1]) if wavs else None
+
+
+def save_voice_profiles(refs, gender_of, sizes, borrowed):
+    """Hifadhi sauti za wahusika (marejeo ya cloning) na muhtasari wao: work/voices/ -> Hugging Face voices/<NAME>/"""
+    d, info = f"{WORK}/voices", {}
+    os.makedirs(d, exist_ok=True)
+    for c, p in refs.items():
+        info[str(c)] = {"gender": gender_of[c], "lines": sizes[c]}
+        if c in borrowed:
+            info[str(c)]["borrowed_from"] = str(borrowed[c])
+        else:
+            shutil.copy(p, f"{d}/speaker{c}.wav"); info[str(c)]["ref"] = f"speaker{c}.wav"
+    json.dump(info, open(f"{d}/speakers.json", "w"), ensure_ascii=False, indent=1)
 
 
 def build_refs(clips, spk, rms, emo, n, target=9.0):
@@ -503,9 +523,7 @@ def f0_median(x):
         ac = np.fft.irfft(np.abs(np.fft.rfft(row * win, 2 * fr)) ** 2)[:fr]
         ac = ac / (ac[0] + 1e-9)
         seg = ac[lo:hi]
-        if len(seg) == 0 or not np.isfinite(seg).all():      # NaN au sehemu tupu: ruka fremu hii
-            continue
-        k = lo + int(np.argmax(seg >= seg.max() - 0.1 * abs(seg.max())))      # kilele cha kwanza karibu na cha juu (inafaa hata thamani zikiwa hasi)
+        k = lo + int(np.where(seg >= 0.9 * seg.max())[0][0])
         if ac[k] > 0.45:
             f.append(SR / k)
     return float(np.median(f)) if len(f) >= 4 else None
@@ -693,9 +711,17 @@ def main():
         try:
             refs = build_refs(clips, spk, rms, emo, n)
             log(f"🧬 Cloning: marejeo ya sauti {len(refs)}/{len(sizes)} wazungumzaji" + ("" if SEPARATE else " (SEPARATE imezimwa: marejeo yana muziki/kelele, ubora utashuka)"))
+            borrowed = {}
+            for c in sizes:                                        # asiye na rejeo safi: atumie sauti ya mwenzake wa jinsia ile ile (mwenye mistari mingi zaidi)
+                if c not in refs and refs:
+                    pool = [x for x in refs if x not in borrowed and gender_of[x] == gender_of[c]] or [x for x in refs if x not in borrowed]
+                    borrowed[c] = max(pool, key=lambda x: sizes[x]); refs[c] = refs[borrowed[c]]
             if refs:
                 cloner = Cloner(refs)
+                save_voice_profiles(refs, gender_of, sizes, borrowed)
         except Exception as e:
+            if STRICT:
+                sys.exit(f"⛔ Cloning imeshindwa kuanza ({str(e)[:300]}). Weka CLONE_STRICT=0 ili itumie MMS, au rekebisha tatizo.")
             log(f"⚠️ Cloning imeshindwa kuanza ({str(e)[:300]}). Nitatumia sauti za MMS.")
 
     def voice_for(g, vi):
@@ -710,6 +736,8 @@ def main():
             if a is not None and len(a):
                 a = a / (float(np.sqrt(np.mean(a ** 2))) + 1e-9) * 0.1 * (EMO_FX[emo[i]]["gain"] if EMOTION else 1.0)
                 return a * float(np.clip((rms[i] / med_rms) ** 0.8, 0.5, 2.0)) if EXPRESSIVE and rms[i] > 0 else a     # pitch haibadilishwi: sauti inabaki ya mwigizaji
+        if CLONE and STRICT and cloner is not None:                            # bila MMS: mstari uliokosa unabaki kimya
+            return None
         g, vi, extra = vmap[spk[i]]
         e = EMO_FX[emo[i]] if EMOTION else EMO_FX["neu"]
         a = voice_for(g, vi)(text, rate=e["rate"])
@@ -732,7 +760,7 @@ def main():
         if i % 100 == 0:
             log(f"  … sauti {i}/{n}")
     if cloner is not None:
-        log(f"🧬 Cloning: mistari {cloner.n} ilijaribiwa, wastani {cloner.t / max(cloner.n, 1):.1f}s kwa mstari" + (" (muda uliisha, zilizobaki ni MMS)" if cloner.off else ""))
+        log(f"🧬 Cloning: mistari {cloner.n} ilijaribiwa, wastani {cloner.t / max(cloner.n, 1):.1f}s kwa mstari | vipande vilivyoshindwa {cloner.fail} | mistari bila sauti {sum(1 for a in aud if a is None)}/{n}" + ((" | ⚠️ muda uliisha: mistari iliyobaki " + ("imebaki kimya" if STRICT else "ni MMS")) if cloner.off else ""))
     avail = [max(segs[i]["end"] - segs[i]["start"], (segs[i + 1]["start"] if i + 1 < n else total) - segs[i]["start"] - 0.15, 0.3) for i in range(n)]
     need = [i for i in range(n) if aud[i] is not None and len(aud[i]) / SR / avail[i] > CONDENSE_RATIO]
     if CONDENSE and need:
@@ -785,8 +813,11 @@ def main():
     api.upload_file(path_or_fileobj=f"{WORK}/sw.json", path_in_repo=f"{PREFIX}{NAME}-sw.json", repo_id=DUB_REPO, repo_type="dataset")
     url = f"https://huggingface.co/datasets/{DUB_REPO}/resolve/main/{PREFIX}{NAME}-sw.mp4"
     log(f"📦 {url}")
-    if E("GITHUB_OUTPUT"):                                      # kwa hatua ya compress inayofuata
-        open(E("GITHUB_OUTPUT"), "a").write(f"url={url}\nname={NAME}-sw\n")
+    if os.path.isdir(f"{WORK}/voices"):                                    # sauti za wahusika (marejeo ya cloning) zihifadhiwe pia
+        api.upload_folder(folder_path=f"{WORK}/voices", path_in_repo=f"{VOICES_PFX}{NAME}", repo_id=DUB_REPO, repo_type="dataset")
+        log(f"🎙️ Sauti za wahusika: https://huggingface.co/datasets/{DUB_REPO}/tree/main/{VOICES_PFX}{NAME}")
+    if E("GITHUB_OUTPUT"):
+        open(E("GITHUB_OUTPUT"), "a").write(f"url={url}\n")
 
 
 if __name__ == "__main__":

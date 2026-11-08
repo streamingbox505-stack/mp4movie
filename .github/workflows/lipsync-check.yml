@@ -1,0 +1,64 @@
+name: Lipsync check (midomo na sauti)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL ya video iliyodubiwa (mf. https://huggingface.co/datasets/jaynesmaxtv/movie-file/resolve/main/dubbed/FAILI-sw.mp4)"
+        required: true
+      name:
+        description: "Jina la ripoti, bila nafasi"
+        required: true
+      windows:
+        description: "Idadi ya sehemu za filamu za kupima (zinasambazwa sawasawa)"
+        required: false
+        default: "3"
+      window_min:
+        description: "Urefu wa kila sehemu kwa dakika"
+        required: false
+        default: "5"
+      orig_url:
+        description: "Hiari: video ya asili (kiwango cha kulinganisha). Weka kiungo cha kudumu, si cha muda mfupi"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lipsync-${{ inputs.name }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"          # mediapipe ina wheels thabiti kwenye 3.11
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Weka zana
+        run: |
+          pip install -q mediapipe opencv-python-headless numpy
+          python -c "import mediapipe as mp; mp.solutions.face_mesh" || pip install -q "mediapipe==0.10.21"
+      - name: Jaribio la hesabu
+        run: SELFTEST=1 python lipsync_check.py
+      - name: Kagua midomo na sauti
+        run: python lipsync_check.py
+        env:
+          SRC_URL: ${{ inputs.url }}
+          NAME: ${{ inputs.name }}
+          WINDOWS: ${{ inputs.windows }}
+          WINDOW_MIN: ${{ inputs.window_min }}
+          ORIG_URL: ${{ inputs.orig_url }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: Hifadhi ripoti
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lipsync-${{ inputs.name }}
+          path: |
+            work/lipsync-*.json
+            work/lipsync-*.md

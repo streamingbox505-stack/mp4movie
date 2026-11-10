@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Ngwele converter: Google Drive -> MP4 (h264+aac, faststart) -> Hugging Face dataset."""
-import json, os, shutil, subprocess, time
+import json, os, re, shutil, subprocess, time
 import gdown, requests
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import CommitOperationCopy, CommitOperationDelete, HfApi, hf_hub_download
 
 API = os.getenv("NGWELE_API", "https://ooqvsqmsnwjqvuzbhczx.supabase.co/functions/v1/ngwele-movie-series")
 REPO = os.getenv("HF_REPO", "jaynesmaxtv/movie-file")
@@ -27,7 +27,7 @@ def fetch_todo():
         for p in d["posts"]:
             for n, e in enumerate(p["episodes"], 1):
                 if not e.get("mp4_url"):
-                    todo.append({"path": f"videos/{p['slug']}-ep{n:02d}.mp4", "id": e["drive_id"],
+                    todo.append({"path": f"videos/ngwele/{p['slug']}/ep{n:02d}.mp4", "id": e["drive_id"],
                                  "title": f"{p['title']} {e['label']}"})
         offset += 50
         if offset >= d["total"] or not d["posts"]:
@@ -65,7 +65,26 @@ def convert(src, dst):
     return "remux" if ok else "re-encode"
 
 
+def migrate():
+    """Move old flat files videos/ngwele-<slug>-epNN.mp4 -> videos/ngwele/<slug>/epNN.mp4 (server-side, no re-upload)."""
+    moves = []
+    for f in api.list_repo_files(REPO, repo_type="dataset"):
+        m = re.fullmatch(r"videos/(ngwele-.+)-ep(\d+)\.mp4", f)
+        if m:
+            moves.append((f, f"videos/ngwele/{m[1]}/ep{m[2]}.mp4"))
+    for i in range(0, len(moves), 100):
+        ops = []
+        for old, new in moves[i:i + 100]:
+            ops += [CommitOperationCopy(src_path_in_repo=old, path_in_repo=new), CommitOperationDelete(path_in_repo=old)]
+        api.create_commit(REPO, ops, repo_type="dataset", commit_message="ngwele: move files into folders")
+        log(f"moved {len(ops) // 2} files into folders")
+
+
 def main():
+    try:
+        migrate()
+    except Exception as e:
+        log("migrate skipped:", str(e)[:200])
     failed = load_failed()
     todo = [t for t in fetch_todo() if failed.get(t["path"], 0) < MAX_TRIES]
     log(f"{len(todo)} episodes to convert, batch={BATCH}")

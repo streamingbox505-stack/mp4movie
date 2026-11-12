@@ -2,7 +2,7 @@
 """Ngwele converter: Google Drive -> MP4 (h264+aac, faststart) -> Hugging Face dataset."""
 import json, os, re, shutil, subprocess, time
 import gdown, requests
-from huggingface_hub import CommitOperationCopy, CommitOperationDelete, HfApi, hf_hub_download
+from huggingface_hub import CommitOperationAdd, CommitOperationCopy, CommitOperationDelete, HfApi, hf_hub_download
 
 API = os.getenv("NGWELE_API", "https://ooqvsqmsnwjqvuzbhczx.supabase.co/functions/v1/ngwele-movie-series")
 REPO = os.getenv("HF_REPO", "jaynesmaxtv/movie-file")
@@ -10,12 +10,33 @@ BATCH = int(os.getenv("BATCH", "100"))
 START = time.time()
 STOP_NEW = START + int(os.getenv("DEADLINE_MIN", "300")) * 60   # no new item after this
 HARD = START + 330 * 60                                          # ffmpeg must end before this
-MAX_TRIES, TMP, FAILED = 3, "work", "ngwele_failed.json"
+MAX_TRIES, COOLDOWN_H, MAX_BLOCKED_IN_ROW = 5, 3, 5
+TMP, FAILED = "work", "ngwele_failed.json"
+GROUP = int(os.getenv("UPLOAD_GROUP", "10"))                                   # faili ngapi kwa commit MOJA
+MAX_PENDING_BYTES = int(float(os.getenv("MAX_PENDING_GB", "6")) * 1e9)         # kinga ya diski ya runner
 api = HfApi(token=os.environ["HF_TOKEN"])
+
+
+class DriveBlocked(Exception):
+    """Drive imekataa (quota ya downloads / ruhusa)."""
 
 
 def log(*a):
     print(*a, flush=True)
+
+
+def hf_retry(fn, *a, **kw):
+    """HF inaweza kujibu 429 (commits nyingi): subiri na ujaribu tena, usianguke."""
+    for i in range(4):
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            if "429" not in str(e) and "Too Many Requests" not in str(e):
+                raise
+            wait = 60 * 2 ** i
+            log(f"  HF 429 - nasubiri {wait}s (jaribio {i + 1}/4)")
+            time.sleep(wait)
+    raise RuntimeError("HF rate limit: nimekata tamaa")
 
 
 def fetch_todo():
@@ -36,14 +57,70 @@ def fetch_todo():
 
 def load_failed():
     try:
-        return json.load(open(hf_hub_download(REPO, FAILED, repo_type="dataset", token=api.token, force_download=True)))
+        raw = json.load(open(hf_hub_download(REPO, FAILED, repo_type="dataset", token=api.token, force_download=True)))
     except Exception:
         return {}
+    return {k: (v if isinstance(v, dict) else {"n": int(v), "t": 0}) for k, v in raw.items()}  # umbo la zamani (namba)
 
 
 def save_failed(failed):
-    api.upload_file(path_or_fileobj=json.dumps(failed, indent=1).encode(), path_in_repo=FAILED,
-                    repo_id=REPO, repo_type="dataset", commit_message="ngwele failed list")
+    try:
+        hf_retry(api.upload_file, path_or_fileobj=json.dumps(failed, indent=1).encode(), path_in_repo=FAILED,
+                 repo_id=REPO, repo_type="dataset", commit_message="ngwele failed list")
+    except Exception as e:  # kushindwa kuhifadhi orodha hii lisiangushe run nzima
+        log("could not save failed list:", str(e)[:160])
+
+
+def skip_failed(failed, path):
+    f = failed.get(path)
+    return bool(f) and (f["n"] >= MAX_TRIES or time.time() - f["t"] < COOLDOWN_H * 3600 * f["n"])
+
+
+def mark_failed(failed, path):
+    f = failed.get(path, {"n": 0, "t": 0})
+    failed[path] = {"n": f["n"] + 1, "t": time.time()}
+
+
+def flush(pending, failed):
+    """Upload faili zote zilizo tayari (`pending`) kwa commit MOJA. Inarudisha idadi iliyofanikiwa."""
+    if not pending:
+        return 0
+    n = len(pending)
+    ops = [CommitOperationAdd(path_in_repo=t["path"], path_or_fileobj=f) for t, f in pending]
+    ok = 0
+    try:
+        log(f"uploading {n} files in ONE commit ...")
+        hf_retry(api.create_commit, REPO, ops, repo_type="dataset", commit_message=f"ngwele: add {n} files")
+        for t, _ in pending:
+            failed.pop(t["path"], None)
+        ok = n
+    except Exception as e:
+        log("  COMMIT FAILED:", str(e).strip().splitlines()[0][:200] if str(e).strip() else type(e).__name__)
+        for t, _ in pending:
+            mark_failed(failed, t["path"])
+    for _, f in pending:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    pending.clear()
+    return ok
+
+
+def download(drive_id, dst):
+    """gdown kwanza; ikishindwa jaribu kiungo cha moja kwa moja cha Drive (confirm=t)."""
+    try:
+        if gdown.download(id=drive_id, output=dst, quiet=True):
+            return
+    except Exception as e:
+        log("  gdown:", str(e).strip().splitlines()[0][:120])
+    with requests.get("https://drive.usercontent.google.com/download", stream=True, timeout=60,
+                      params={"id": drive_id, "export": "download", "confirm": "t"}) as r:
+        if r.status_code != 200 or "text/html" in r.headers.get("content-type", ""):
+            raise DriveBlocked("Drive imekataa (quota ya downloads au faili si ya umma)")
+        with open(dst, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
 
 
 def convert(src, dst):
@@ -76,7 +153,7 @@ def migrate():
         ops = []
         for old, new in moves[i:i + 100]:
             ops += [CommitOperationCopy(src_path_in_repo=old, path_in_repo=new), CommitOperationDelete(path_in_repo=old)]
-        api.create_commit(REPO, ops, repo_type="dataset", commit_message="ngwele: move files into folders")
+        hf_retry(api.create_commit, REPO, ops, repo_type="dataset", commit_message="ngwele: move files into folders")
         log(f"moved {len(ops) // 2} files into folders")
 
 
@@ -86,34 +163,50 @@ def main():
     except Exception as e:
         log("migrate skipped:", str(e)[:200])
     failed = load_failed()
-    todo = [t for t in fetch_todo() if failed.get(t["path"], 0) < MAX_TRIES]
-    log(f"{len(todo)} episodes to convert, batch={BATCH}")
-    done = 0
-    for t in todo:
-        if done >= BATCH or time.time() > STOP_NEW:
-            break
-        if api.file_exists(REPO, t["path"], repo_type="dataset"):
-            continue
-        shutil.rmtree(TMP, ignore_errors=True)
-        os.makedirs(TMP)
-        src, dst = f"{TMP}/in.bin", f"{TMP}/out.mp4"
-        try:
-            log("downloading:", t["title"])
-            if not gdown.download(id=t["id"], output=src, quiet=True):
-                raise RuntimeError("Drive download failed (private file or quota)")
-            mode = convert(src, dst)
-            log(f"  {mode}, {os.path.getsize(dst) / 1e6:.0f} MB -> uploading {t['path']}")
-            api.upload_file(path_or_fileobj=dst, path_in_repo=t["path"], repo_id=REPO,
-                            repo_type="dataset", commit_message=f"add {t['path']}")
-            if t["path"] in failed:
-                del failed[t["path"]]
-                save_failed(failed)
-            done += 1
-        except Exception as e:
-            failed[t["path"]] = failed.get(t["path"], 0) + 1
-            log("  FAILED:", t["title"], "->", str(e)[:200])
-            save_failed(failed)
+    before = json.dumps(failed, sort_keys=True)
+    todo = [t for t in fetch_todo() if not skip_failed(failed, t["path"])]
+    log(f"{len(todo)} episodes to convert, batch={BATCH}, upload group={GROUP}")
     shutil.rmtree(TMP, ignore_errors=True)
+    os.makedirs(f"{TMP}/out")
+    pending, pending_bytes, done, seq, blocked_in_row = [], 0, 0, 0, 0
+    try:
+        for t in todo:
+            if done + len(pending) >= BATCH or time.time() > STOP_NEW:
+                break
+            if blocked_in_row >= MAX_BLOCKED_IN_ROW:
+                log(f"Drive imezuia {blocked_in_row} mfululizo (quota). Nasimama; run inayofuata itajaribu tena.")
+                break
+            if api.file_exists(REPO, t["path"], repo_type="dataset"):
+                continue
+            cur = f"{TMP}/cur"
+            shutil.rmtree(cur, ignore_errors=True)
+            os.makedirs(cur)
+            src, dst = f"{cur}/in.bin", f"{cur}/out.mp4"
+            try:
+                log("downloading:", t["title"])
+                download(t["id"], src)
+                blocked_in_row = 0
+                mode = convert(src, dst)
+                os.remove(src)
+                seq += 1
+                out = f"{TMP}/out/{seq:04d}.mp4"
+                os.replace(dst, out)
+                size = os.path.getsize(out)
+                pending.append((t, out))
+                pending_bytes += size
+                log(f"  {mode}, {size / 1e6:.0f} MB ready ({len(pending)}/{GROUP} waiting for upload)")
+                if len(pending) >= GROUP or pending_bytes >= MAX_PENDING_BYTES:
+                    done += flush(pending, failed)
+                    pending_bytes = 0
+            except Exception as e:
+                blocked_in_row = blocked_in_row + 1 if isinstance(e, DriveBlocked) else 0
+                mark_failed(failed, t["path"])
+                log("  FAILED:", t["title"], "->", str(e).strip().splitlines()[0][:160] if str(e).strip() else type(e).__name__)
+        done += flush(pending, failed)   # zilizobaki (chini ya GROUP) zinapakiwa pamoja mwishoni
+    finally:
+        shutil.rmtree(TMP, ignore_errors=True)
+        if json.dumps(failed, sort_keys=True) != before:
+            save_failed(failed)   # commit MOJA mwishoni
     log(f"done: {done} uploaded in {(time.time() - START) / 60:.0f} min")
 
 

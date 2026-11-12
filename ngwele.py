@@ -6,7 +6,7 @@ from huggingface_hub import CommitOperationCopy, CommitOperationDelete, HfApi, h
 
 API = os.getenv("NGWELE_API", "https://ooqvsqmsnwjqvuzbhczx.supabase.co/functions/v1/ngwele-movie-series")
 REPO = os.getenv("HF_REPO", "jaynesmaxtv/movie-file")
-BATCH = int(os.getenv("BATCH", "20"))
+BATCH = int(os.getenv("BATCH", "100"))
 START = time.time()
 STOP_NEW = START + int(os.getenv("DEADLINE_MIN", "300")) * 60   # no new item after this
 HARD = START + 330 * 60                                          # ffmpeg must end before this

@@ -2,12 +2,12 @@ name: ngwele-converter
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */2 * * *"
   workflow_dispatch:
     inputs:
       batch:
         description: "Files per run"
-        default: "20"
+        default: "100"
 
 concurrency:
   group: ngwele-converter
@@ -31,4 +31,5 @@ jobs:
         run: python ngwele.py
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          BATCH: ${{ inputs.batch || '20' }}
+          BATCH: ${{ inputs.batch || '100' }}
+          

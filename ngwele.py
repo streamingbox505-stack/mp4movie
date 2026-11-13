@@ -10,7 +10,7 @@ BATCH = int(os.getenv("BATCH", "100"))
 START = time.time()
 STOP_NEW = START + int(os.getenv("DEADLINE_MIN", "300")) * 60   # no new item after this
 HARD = START + 330 * 60                                          # ffmpeg must end before this
-MAX_TRIES, COOLDOWN_H, MAX_BLOCKED_IN_ROW = 5, 3, 5
+MAX_TRIES, COOLDOWN_H, MAX_BLOCKED_IN_ROW = 5, 3, 25   # quota ya Drive ni ya kila faili, si ya runner nzima
 TMP, FAILED = "work", "ngwele_failed.json"
 GROUP = int(os.getenv("UPLOAD_GROUP", "10"))                                   # faili ngapi kwa commit MOJA
 MAX_PENDING_BYTES = int(float(os.getenv("MAX_PENDING_GB", "6")) * 1e9)         # kinga ya diski ya runner
@@ -107,10 +107,19 @@ def flush(pending, failed):
     return ok
 
 
+def looks_like_video(path):
+    """Ukurasa wa HTML wa Drive (quota) au faili dogo sana si video."""
+    if os.path.getsize(path) < 100_000:
+        return False
+    with open(path, "rb") as f:
+        head = f.read(512).lower()
+    return b"<html" not in head and b"<!doctype" not in head
+
+
 def download(drive_id, dst):
     """gdown kwanza; ikishindwa jaribu kiungo cha moja kwa moja cha Drive (confirm=t)."""
     try:
-        if gdown.download(id=drive_id, output=dst, quiet=True):
+        if gdown.download(id=drive_id, output=dst, quiet=True) and looks_like_video(dst):
             return
     except Exception as e:
         log("  gdown:", str(e).strip().splitlines()[0][:120])
@@ -121,25 +130,60 @@ def download(drive_id, dst):
         with open(dst, "wb") as f:
             for chunk in r.iter_content(1 << 20):
                 f.write(chunk)
+    if not looks_like_video(dst):
+        raise DriveBlocked("Drive ilirudisha ukurasa/faili dogo, si video (quota?)")
+
+
+def run_ffmpeg(cmd):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=max(300, HARD - time.time()))
+    if p.returncode:
+        lines = [l for l in p.stderr.strip().splitlines() if l.strip()]
+        raise RuntimeError("ffmpeg: " + (lines[-1][:150] if lines else f"exit {p.returncode}"))
 
 
 def convert(src, dst):
-    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt",
-                          "-of", "json", src], capture_output=True, text=True, check=True).stdout
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt",
+                              "-of", "json", src], capture_output=True, text=True, check=True).stdout
+    except subprocess.CalledProcessError:
+        raise RuntimeError("faili si video halali (imeharibika au haikupakuliwa kikamilifu)")
     s = json.loads(out)["streams"]
     v = next((x for x in s if x["codec_type"] == "video"), None)
     a = next((x for x in s if x["codec_type"] == "audio"), None)
     if not v:
         raise RuntimeError("no video stream (not a video / quota page?)")
-    ok = v["codec_name"] == "h264" and v.get("pix_fmt") == "yuv420p" and a and a["codec_name"] == "aac"
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", src, "-map", "0:v:0", "-map", "0:a:0?"]
-    if ok:
-        cmd += ["-c", "copy"]
-    else:
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k"]
-    cmd += ["-movflags", "+faststart", dst]
-    subprocess.run(cmd, check=True, timeout=max(300, HARD - time.time()))
-    return "remux" if ok else "re-encode"
+    maps = ["-map", "0:v:0", "-map", "0:a:0?"]
+    enc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k"]
+    tail = ["-movflags", "+faststart", dst]
+    even = ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1"]
+    if v["codec_name"] == "h264" and v.get("pix_fmt") == "yuv420p" and a and a["codec_name"] == "aac":
+        try:
+            run_ffmpeg(["ffmpeg", "-y", "-v", "error", "-i", src, *maps, "-c", "copy", *tail])
+            return "remux"
+        except RuntimeError as e:
+            log("  remux failed, re-encoding:", e)
+    mkv = dst + ".mkv"
+    steps = [  # kila ngazi ikishindwa, inayofuata inajaribiwa (muxer ya mp4 inaweza kukataa timestamps/packets zisizo za kawaida)
+        ("re-encode", [["ffmpeg", "-y", "-v", "error", "-i", src, *maps, *enc, *tail]]),
+        ("re-encode (even size, genpts)", [["ffmpeg", "-y", "-v", "error", "-fflags", "+genpts", "-i", src, *maps, *even, *enc,
+                                            "-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", *tail]]),
+        ("re-encode via mkv", [["ffmpeg", "-y", "-v", "error", "-fflags", "+genpts", "-i", src, *maps, *even, *enc, "-f", "matroska", mkv],
+                               ["ffmpeg", "-y", "-v", "error", "-fflags", "+genpts", "-i", mkv, "-c", "copy",
+                                "-avoid_negative_ts", "make_zero", *tail]]),
+    ]
+    err = None
+    for name, cmds in steps:
+        try:
+            for c in cmds:
+                run_ffmpeg(c)
+            return name
+        except RuntimeError as e:
+            err = e
+            log(f"  {name} failed: {e}")
+            for p in (dst, mkv):
+                if os.path.exists(p):
+                    os.remove(p)
+    raise err
 
 
 def migrate():

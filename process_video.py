@@ -77,7 +77,7 @@ def fetch_todo():
         dst_files = set()
     return [
         f for f in src_files
-        if f.startswith("videos/") and f.endswith(".mp4")
+        if f.startswith("videos/edit/") and f.endswith(".mp4")
         and f not in dst_files
     ]
 
@@ -223,7 +223,7 @@ def process_one(hf_path):
     transcript_path = str(TMP / "transcript.json")
     json.dump(segs, open(transcript_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-    dst_vid  = hf_path.replace("videos/ngwele/", "videos/ngwele-pro/")
+    dst_vid  = hf_path.replace("videos/edit/", "videos/edited-pro/")
     dst_json = dst_vid.replace(".mp4", "_transcript.json")
 
     api.upload_file(path_or_fileobj=final_out,        path_in_repo=dst_vid,

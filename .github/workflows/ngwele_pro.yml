@@ -1,0 +1,63 @@
+name: ngwele-pro-processor
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"        # kila masaa 4
+  workflow_dispatch:
+    inputs:
+      batch:
+        description: "Videos per run"
+        default: "5"
+      whisper_model:
+        description: "Whisper model (tiny/base/small/medium/large-v3)"
+        default: "medium"
+      bg_image:
+        description: "Path to background image in repo (optional)"
+        default: ""
+
+concurrency:
+  group: ngwele-pro
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ffmpeg \
+            libgl1 \
+            libglib2.0-0 \
+            fonts-noto          # Noto fonts for Swahili subtitle rendering
+
+      - name: Install Python deps
+        run: |
+          pip install -q --upgrade pip
+          pip install -q \
+            rembg \
+            openai-whisper \
+            torch torchvision --index-url https://download.pytorch.org/whl/cpu \
+            opencv-python-headless \
+            Pillow numpy soundfile \
+            huggingface_hub gdown requests
+
+      - name: Run Ngwele Pro processor
+        run: python process_video.py
+        env:
+          HF_TOKEN:       ${{ secrets.HF_TOKEN }}
+          HF_SRC_REPO:    jaynesmaxtv/movie-file
+          HF_DST_REPO:    jaynesmaxtv/movie-file-pro
+          BATCH:          ${{ inputs.batch || '5' }}
+          WHISPER_MODEL:  ${{ inputs.whisper_model || 'medium' }}
+          BG_IMAGE:       ${{ inputs.bg_image || '' }}
+          DEADLINE_MIN:   "300"

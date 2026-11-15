@@ -453,4 +453,49 @@ def main():
             cur.mkdir()
             src, dst = cur / 'in.bin', cur / 'out.mp4'
             try:
-           
+                log('Downloading:', task['title'])
+                download(task['id'], src)
+                blocked = 0
+                mode = convert(src, dst)
+                src.unlink(missing_ok=True)
+                out = TMP / 'out' / f'{seq:04d}.mp4'
+                dst.replace(out)
+                pending.append((task, out))
+                pending_bytes += out.stat().st_size
+                log(mode, 'ready:', out.stat().st_size // 1_000_000, 'MB')
+            except TimeoutError as error:
+                log('Stopping for deadline:', error)
+                break
+            except Exception as error:
+                blocked = blocked + 1 if isinstance(error, DriveBlocked) else 0
+                mark_failed(failed, task['path'], error)
+                log('FAILED:', task['title'], str(error)[:250])
+                continue
+            if len(pending) >= GROUP or pending_bytes >= MAX_PENDING_BYTES:
+                done += flush(api, pending, failed, files)
+                pending_bytes = 0
+        done += flush(api, pending, failed, files)
+    finally:
+        # Publish metadata even if a commit fails; MP4 URLs refer only to confirmed files.
+        data = manifest_data(extras, files)
+        write_json('ngwele-extra-local.json', data)
+        write_json('ngwele-failed-local.json', failed)
+        state_errors = []
+        for name, value in ((FAILED, failed), (MANIFEST, data)):
+            try:
+                hf_retry(api.upload_file, path_or_fileobj=json.dumps(value, ensure_ascii=False, indent=2).encode(),
+                         path_in_repo=name, repo_id=REPO, repo_type='dataset', commit_message='ngwele: update ' + name)
+            except Exception as error:
+                state_errors.append((name, error))
+                log('Could not save', name, str(error)[:250])
+        if not pending:
+            shutil.rmtree(TMP, ignore_errors=True)
+        else:
+            log('Upload failed: unuploaded MP4s retained locally in', TMP / 'out')
+        if state_errors:
+            raise RuntimeError('Could not publish state; local backup JSON files remain') from state_errors[0][1]
+    log('Done:', done, 'uploaded;', 'API must merge', MANIFEST, 'to display extras')
+
+
+if __name__ == '__main__':
+    main(

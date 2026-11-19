@@ -1,364 +1,285 @@
-#!/usr/bin/env python3
-"""Absalom converter: Google Drive -> thibitisha MP4 -> Hugging Face -> Supabase.
-
-Inasoma absalom_episodes moja kwa moja (service role). Siri zote ziko kwenye
-environment (GitHub Secrets). Hakuna siri kwenye faili hili.
-
-Haraka: vipindi vinapakuliwa na kuthibitishwa sambamba (WORKERS), kisha
-vinapakiwa kwa commit moja kwa kila CHUNK.
-"""
-import json
-import os
-import re
-import shutil
-import subprocess
-import sys
-import tempfile
-import time
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-
+"""Drive -> mp4 (ffmpeg) -> Hugging Face kwa vyanzo vinne:
+  absalom, movies, ngwele  : kazi zinatoka Cloudflare (convert-api, D1) na matokeo yanarudishwa huko
+  netswahili               : inasoma netswahili.com moja kwa moja (sitemap -> posts -> Drive), HF ndiyo ukweli;
+                             posts zenye mp4 zinatumwa kwa tr-admin /n2/import-rows (Zilizotafsiriwa za n2)
+Video hazipiti Supabase wala Cloudflare: Drive -> runner ya GitHub -> Hugging Face.
+Env: CF_API, ADMIN_KEY, HF_TOKEN | BATCH=3 SOURCES=absalom,movies,ngwele,netswahili
+     NETS_SINCE_DAYS=14 (0 = zote) MAIN_REPO=jaynesmaxtv/movie-file NETS_REPO=JAYNESTV/iphone-stream"""
+import glob, html as htmllib, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.parse
+from datetime import date, timedelta
 import requests
+from huggingface_hub import HfApi
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-HF_REPO = os.environ.get("HF_REPO", "jaynesmaxtv/movie-file")
-HF_REPO_TYPE = os.environ.get("HF_REPO_TYPE", "dataset")  # dataset | model | space
-LIMIT = int(os.environ.get("LIMIT", "80"))       # vipindi vingi zaidi kwa run moja
-WORKERS = int(os.environ.get("WORKERS", "4"))    # downloads sambamba
-CHUNK = int(os.environ.get("CHUNK", "4"))        # vipindi kwa commit moja ya HF
-MAX_TRIES = 3
-MAX_RUNTIME_MIN = int(os.environ.get("MAX_RUNTIME_MIN", "320"))
-MIN_FREE_GB = float(os.environ.get("MIN_FREE_GB", "5"))  # acha diski ya kutosha
-DRY_RUN = os.environ.get("DRY_RUN") == "1"
-ONLY_SLUGS = [s.strip() for s in os.environ.get("ONLY_SLUGS", "").split(",") if s.strip()]
-
-QUOTA_STOP = int(os.environ.get("QUOTA_STOP", "3"))  # simama baada ya makosa ya quota haya
-MIN_BYTES = 200_000
-MIN_SECONDS = 10.0
-
-HF_BASE = {
-    "dataset": "https://huggingface.co/datasets/",
-    "model": "https://huggingface.co/",
-    "space": "https://huggingface.co/spaces/",
-}
+CF_API = os.environ.get("CF_API", "").rstrip("/")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+HF_TOKEN = os.environ["HF_TOKEN"]
+BATCH = int(os.environ.get("BATCH", "3"))
+SOURCES = [s.strip() for s in os.environ.get("SOURCES", "absalom,movies,ngwele,netswahili").split(",") if s.strip()]
+SINCE_DAYS = int(os.environ.get("NETS_SINCE_DAYS", "14"))
+NETS_REPO = os.environ.get("NETS_REPO", "JAYNESTV/iphone-stream")
+api = HfApi(token=HF_TOKEN)
+UA = {"User-Agent": "JaynesMaxTV-converter/1.0"}  # Cloudflare inakataa UA za chaguo-msingi za Python (403 / 1010)
 
 
-def mask(text: str) -> str:
-    """Ondoa siri zozote kwenye ujumbe kabla ya kuuandika."""
-    for secret in (SERVICE_KEY, HF_TOKEN):
-        if secret:
-            text = text.replace(secret, "***")
-    return text
+def cf(method, path, **kw):
+    r = requests.request(method, CF_API + path, headers={"x-admin-key": ADMIN_KEY, **UA}, timeout=120, **kw)
+    r.raise_for_status()
+    return r.json()
 
 
-def short(text, n: int = 400) -> str:
-    return mask(" ".join(str(text).split()))[:n]
-
-
-def now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def rest(method: str, path: str, **kw):
-    headers = {
-        "apikey": SERVICE_KEY,
-        "Authorization": f"Bearer {SERVICE_KEY}",
-        "Content-Type": "application/json",
-    }
-    headers.update(kw.pop("headers", {}))
-    r = requests.request(method, f"{SUPABASE_URL}/rest/v1/{path}", headers=headers, timeout=60, **kw)
-    if not r.ok:
-        raise RuntimeError(f"Supabase {r.status_code}: {short(r.text)}")
-    return r.json() if r.text else None
-
-
-def fetch_pending(limit: int):
-    params = {
-        # !inner: inachuja kwa slug ya post ikiwa ONLY_SLUGS imewekwa
-        "select": "id,wp_id,position,label,drive_id,status,tries,absalom_posts!inner(slug)",
-        "or": f"(status.eq.pending,and(status.eq.failed,tries.lt.{MAX_TRIES}))",
-        "order": "updated_at.asc,wp_id.asc,position.asc",
-        "limit": str(limit),
-    }
-    if ONLY_SLUGS:
-        params["absalom_posts.slug"] = "in.(" + ",".join(ONLY_SLUGS) + ")"
-    return rest("GET", "absalom_episodes", params=params)
-
-
-def mark_done(ep, mp4_url: str):
-    rows = rest(
-        "PATCH",
-        f"absalom_episodes?id=eq.{ep['id']}",
-        json={"mp4_url": mp4_url, "status": "done", "error": None, "updated_at": now_iso()},
-        headers={"Prefer": "return=representation"},
-    )
-    if not rows:
-        print(f"  ONYO: kipindi id={ep['id']} hakikupatikana wakati wa kuandika mp4_url", flush=True)
-
-
-def mark_failed(ep, reason: str):
-    rest(
-        "PATCH",
-        f"absalom_episodes?id=eq.{ep['id']}",
-        json={
-            "status": "failed",
-            "error": short(reason),
-            "tries": int(ep.get("tries") or 0) + 1,
-            "updated_at": now_iso(),
-        },
-    )
-
-
-def mark_retry(ep, reason: str):
-    """Kosa la muda (quota ya Drive): rudisha pending bila kuongeza tries."""
-    rest(
-        "PATCH",
-        f"absalom_episodes?id=eq.{ep['id']}",
-        json={"status": "pending", "error": short(reason), "updated_at": now_iso()},
-    )
-
-
-def is_quota(reason: str) -> bool:
-    """Kosa la quota la kweli pekee: download yenyewe imeshindwa. HTML ni kesi tofauti (DRIVE_HTML)."""
-    return reason.startswith("DRIVE_QUOTA")
-
-
-def run(cmd, timeout):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-
-
-def verify_mp4(path: Path):
-    """Inarudisha (True, "") au (False, sababu)."""
-    size = path.stat().st_size
-    if size < MIN_BYTES:
-        return False, f"Faili dogo sana ({size} bytes); huenda ni ukurasa wa Drive, si video"
-    with open(path, "rb") as f:
-        head = f.read(12)
-    if head[4:8] != b"ftyp":
-        with open(path, "rb") as fh:
-            sniff = fh.read(64).lstrip().lower()
-        if sniff.startswith(b"<"):
-            return False, "DRIVE_HTML: Drive ilirudisha ukurasa wa HTML (uthibitisho au ruhusa), si video"
-        return False, "Si MP4 (hakuna 'ftyp')"
+def exists(repo, path):
     try:
-        p = run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=format_name,duration:stream=codec_type",
-             "-of", "json", str(path)],
-            timeout=90,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "ffprobe imechukua muda mrefu sana"
-    if p.returncode != 0:
-        return False, f"ffprobe imeshindwa: {short(p.stderr)}"
-    info = json.loads(p.stdout or "{}")
-    fmt = info.get("format", {})
-    if "mp4" not in str(fmt.get("format_name", "")):
-        return False, f"Muundo si MP4: {fmt.get('format_name')}"
-    if not any(s.get("codec_type") == "video" for s in info.get("streams", [])):
-        return False, "Hakuna video stream"
-    try:
-        dur = float(fmt.get("duration"))
-    except (TypeError, ValueError):
-        return False, "Muda wa video haujulikani"
-    if dur < MIN_SECONDS:
-        return False, f"Video fupi sana ({dur:.1f}s)"
-    # Kusimbua mwanzo na mwisho: mwisho unagundua faili lililokatika
-    for label, args in (("mwanzo", ["-t", "10"]), ("mwisho", ["-ss", str(max(0.0, dur - 8)), "-t", "8"])):
-        try:
-            d = run(["ffmpeg", "-v", "error", "-xerror", *args, "-i", str(path), "-f", "null", "-"], timeout=300)
-        except subprocess.TimeoutExpired:
-            return False, f"Kusimbua {label} kumechukua muda mrefu sana"
-        if d.returncode != 0 or d.stderr.strip():
-            return False, f"Kosa la kusimbua {label}: {short(d.stderr, 200)}"
-    return True, ""
+        r = requests.head(f"https://huggingface.co/datasets/{repo}/resolve/main/{path}", allow_redirects=True, timeout=30)
+        return r.status_code == 200
+    except Exception:
+        return False
 
 
-def download(drive_id: str, dest: Path):
-    import gdown
-
-    out = gdown.download(id=drive_id, output=str(dest), quiet=True, fuzzy=True)
-    if not out or not dest.exists():
-        raise RuntimeError("DRIVE_QUOTA: Drive haikutoa faili (ruhusa au quota)")
+def probe(path):
+    out = subprocess.check_output(["ffprobe", "-v", "error", "-show_entries",
+                                   "stream=codec_type,codec_name:format=duration", "-of", "json", path])
+    return json.loads(out)
 
 
-def safe_slug(slug: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z0-9._%-]+", slug)) and not slug.startswith(".") and ".." not in slug
-
-
-def codec_of(path: Path, sel: str):
-    """codec_name ya stream ya kwanza (v:0 au a:0); None ikiwa haipo."""
-    p = run(["ffprobe", "-v", "error", "-select_streams", sel,
-             "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)], timeout=90)
-    if p.returncode != 0:
-        raise RuntimeError(f"ffprobe {sel}: {short(p.stderr)}")
-    out = p.stdout.strip().splitlines()
-    return out[0].strip() if out and out[0].strip() else None
-
-
-def convert_file(src: Path, dst: Path) -> dict:
-    """Video h264 + audio aac -> copy. Video si h264 -> re-encode video na audio.
-    Audio si aac (video h264) -> re-encode audio tu. Inarudisha {'vcodec','acodec','action'}."""
-    vcodec = codec_of(src, "v:0")
-    acodec = codec_of(src, "a:0")
-    if vcodec != "h264":
-        action = "reencode-video"
-        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src),
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-profile:v", "main",
-               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-ac", "2",
-               "-movflags", "+faststart", str(dst)]
-    elif acodec not in (None, "aac"):
-        action = "reencode-audio"
-        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src),
-               "-c:v", "copy", "-c:a", "aac", "-b:a", "96k", "-ac", "2",
-               "-movflags", "+faststart", str(dst)]
+def make_mp4(src, dst):
+    info = probe(src)
+    codecs = {s["codec_type"]: s["codec_name"] for s in info["streams"]}
+    dur = float(info["format"].get("duration") or 0)
+    if "video" not in codecs or dur < 30:
+        raise RuntimeError("faili_si_video_halali")
+    if codecs["video"] == "h264" and codecs.get("audio") in (None, "aac"):
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-c", "copy", "-movflags", "+faststart", dst]
     else:
-        action = "copy"
-        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-c", "copy",
-               "-movflags", "+faststart", str(dst)]
-    p = run(cmd, timeout=5 * 3600)
-    if p.returncode != 0:
-        raise RuntimeError(f"ffmpeg({action}): {short(p.stderr)}")
-    if codec_of(dst, "v:0") != "h264":
-        raise RuntimeError("Baada ya ubadilishaji video bado si h264")
-    return {"vcodec": vcodec, "acodec": acodec, "action": action}
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-c:v", "libx264", "-preset", "veryfast",
+               "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", dst]
+    subprocess.check_call(cmd)
+    out_dur = float(probe(dst)["format"].get("duration") or 0)
+    if abs(out_dur - dur) > 5:
+        raise RuntimeError("urefu_haulingani")
+    return out_dur
 
 
-def process(ep, tmp: Path):
-    """Inapakua na kuthibitisha kipindi kimoja. Haigusi DB (hufanywa na main thread)."""
-    post = ep.get("absalom_posts") or {}
-    slug = post.get("slug") or ""
-    tag = f"{slug}/{ep['position']}"
-    if not safe_slug(slug):
-        return ep, None, None, f"Slug si salama: {slug!r}"
-    f = tmp / f"{ep['id']}.mp4"
+def download(drive_id, tmp):
+    subprocess.check_call(["gdown", f"https://drive.google.com/uc?id={drive_id}", "-O", tmp + "/", "-q"])
+    files = [f for f in glob.glob(tmp + "/*") if os.path.isfile(f)]
+    if not files:
+        raise RuntimeError("drive_haikupakuliwa")
+    return files[0]
+
+
+# jina la mp4 la netswahili = kanuni ile ile ya movie-public (slug ya jina la asili la faili la Drive)
+def clean_title(n):
+    i = n.rfind(".")
+    b = n[:i] if (i > 0 and re.search(r"[^.]", n[:i])) else n
+    b = re.sub(r"(https?://)?www\.\S+", " ", b, flags=re.I)
+    b = re.sub(r"[^\w\s\-.()]", " ", b)
+    b = re.sub(r"\s+", " ", b)
+    b = re.sub(r"^[ .\-_]+|[ .\-_]+$", "", b)
+    return (b or "video")[:80]
+
+
+def mp4_name(n):
+    return (re.sub(r"[^A-Za-z0-9]+", "-", clean_title(n)).strip("-").lower() or "video") + ".mp4"
+
+
+def convert_and_upload(drive_id, repo, path_fn):
+    """path_fn(faili_lililopakuliwa) -> hf_path. Inarudisha (hf_path, size, duration, skipped)."""
+    tmp = tempfile.mkdtemp()
     try:
-        download(ep["drive_id"], f)
-        ok, why = verify_mp4(f)
-        if not ok:
-            raise RuntimeError(why)
-        out = tmp / f"{ep['id']}.out.mp4"
-        info = convert_file(f, out)
-        f.unlink(missing_ok=True)
-        print(f"  {tag}: video={info['vcodec']} audio={info['acodec']} -> {info['action']}", flush=True)
-    except Exception as e:  # noqa: BLE001
-        for x in (f, tmp / f"{ep['id']}.out.mp4"):
-            x.unlink(missing_ok=True)
-        return ep, None, None, str(e)
-    return ep, f"videos/absalom/{slug}/{ep['position']}.mp4", out, None
+        src = download(drive_id, tmp)
+        path = path_fn(src)
+        if exists(repo, path):
+            return path, None, None, True
+        dst = tmp + "/out.mp4"
+        dur = make_mp4(src, dst)
+        api.upload_file(path_or_fileobj=dst, path_in_repo=path, repo_id=repo, repo_type="dataset")
+        return path, os.path.getsize(dst), int(dur), False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
-def commit_with_retry(api, ops, message: str):
-    last = None
-    for attempt in range(3):
+def run_cloudflare(source):
+    jobs = cf("GET", f"/jobs?source={source}&limit={BATCH}").get("jobs", [])
+    print(f"[{source}] kazi: {len(jobs)}")
+    for j in jobs:
+        rep = {"source": source, "id": j.get("id"), "key": j.get("key"), "hf_path": j["hf_path"]}
         try:
-            return api.create_commit(
-                repo_id=HF_REPO, repo_type=HF_REPO_TYPE, operations=ops, commit_message=message,
-            )
-        except Exception as e:  # noqa: BLE001
-            last = e
-            time.sleep(30 * (attempt + 1))
-    raise last
+            if exists(j["repo"], j["hf_path"]):
+                rep.update(ok=True)  # tayari ipo HF, usipakue tena
+            else:
+                _, size, dur, _ = convert_and_upload(j["drive_id"], j["repo"], lambda _f, p=j["hf_path"]: p)
+                rep.update(ok=True, size_bytes=size, duration_sec=dur)
+            print("OK  ", source, j["hf_path"])
+        except Exception as e:  # noqa
+            rep.update(ok=False, error=str(e)[:200])
+            print("FAIL", source, j["hf_path"], e, file=sys.stderr)
+        cf("POST", "/report", json=rep)
 
 
-def write_summary(lines):
-    p = os.environ.get("GITHUB_STEP_SUMMARY")
-    if p:
-        with open(p, "a", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+# ---------- netswahili.com (port ya movie-public) ----------
+SITE = "https://netswahili.com"
+NUA = {"User-Agent": "Mozilla/5.0 (compatible; JaynesTV-Sync/1.0)", "Accept-Language": "sw,en;q=0.8"}
+DRIVE_DL = "https://drive.usercontent.google.com/download"
+DRIVE_UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/124.0 Mobile"
+PAGE = 10
+NAMES = {}  # drive_id -> jina la faili (mafanikio tu)
 
 
-def main() -> int:
-    missing = [n for n, v in (("SUPABASE_URL", SUPABASE_URL), ("SUPABASE_SERVICE_ROLE_KEY", SERVICE_KEY),
-                              ("HF_TOKEN", HF_TOKEN)) if not v]
-    if not SUPABASE_URL or not SERVICE_KEY:
-        print("SUPABASE_URL na SUPABASE_SERVICE_ROLE_KEY zinahitajika")
-        return 2
-    if missing and not DRY_RUN:
-        print("Hazipo kwenye environment:", ", ".join(missing))
-        return 2
-    if HF_REPO_TYPE not in HF_BASE:
-        print("HF_REPO_TYPE lazima iwe dataset, model au space")
-        return 2
+def decode(t):
+    return htmllib.unescape(t)
 
-    started = time.time()
-    deadline = started + MAX_RUNTIME_MIN * 60
-    todo = fetch_pending(LIMIT)
-    print(f"Vipindi vya kushughulikia: {len(todo)} (LIMIT={LIMIT}, WORKERS={WORKERS}, CHUNK={CHUNK})", flush=True)
 
-    if DRY_RUN:
-        for ep in todo:
-            post = ep.get("absalom_posts") or {}
-            print(f"  [{ep['status']}] {post.get('slug')}/{ep['position']}.mp4  ({ep['label']})")
-        return 0
+def strip(t):
+    return re.sub(r"\s+", " ", decode(re.sub(r"<[^>]*>", " ", t))).strip()
 
-    from huggingface_hub import CommitOperationAdd, HfApi
 
-    api = HfApi(token=HF_TOKEN)
-    done = failed = quota_hits = 0
-    log = []
-
-    for i in range(0, len(todo), CHUNK):
-        if time.time() > deadline:
-            print("Muda wa run umeisha; vilivyobaki vitachukuliwa run inayofuata.", flush=True)
-            break
-        if quota_hits >= QUOTA_STOP:
-            print(f"Drive quota imefika mara {quota_hits}; nasimama, run inayofuata itaendelea.", flush=True)
-            break
-        free_gb = shutil.disk_usage(tempfile.gettempdir()).free / 1e9
-        if free_gb < MIN_FREE_GB:
-            print(f"Diski ina {free_gb:.1f}GB tu; nasimama ili nisijaze runner.", flush=True)
-            break
-
-        chunk = todo[i:i + CHUNK]
-        tmp = Path(tempfile.mkdtemp(prefix="absalom_"))
+def get_text(url, data=None, headers=None, tries=3):
+    err = None
+    for i in range(tries):
         try:
-            with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-                results = list(pool.map(lambda ep: process(ep, tmp), chunk))
+            r = requests.request("POST" if data is not None else "GET", url, data=data,
+                                 headers={**NUA, **(headers or {})}, timeout=25)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:  # noqa
+            err = e
+            time.sleep(0.4 * (i + 1))
+    raise RuntimeError(f"fetch failed: {url} — {err}")
 
-            ready = []
-            for ep, path, f, reason in results:
-                if reason:
-                    if is_quota(reason):
-                        mark_retry(ep, reason)
-                        quota_hits += 1
-                        log.append(f"RETRY id={ep['id']}: {short(reason, 160)}")
-                        print(f"  RETRY id={ep['id']} (quota): {short(reason, 160)}", flush=True)
-                    else:
-                        mark_failed(ep, reason)
-                        failed += 1
-                        log.append(f"FAIL {ep['id']}: {short(reason, 160)}")
-                        print(f"  FAIL id={ep['id']}: {short(reason, 160)}", flush=True)
-                else:
-                    ready.append((ep, path, f))
 
-            if ready:
-                ops = [CommitOperationAdd(path_in_repo=p, path_or_fileobj=str(f)) for _, p, f in ready]
-                try:
-                    commit_with_retry(api, ops, f"absalom: add {len(ready)} episode(s)")
-                except Exception as e:  # noqa: BLE001
-                    for ep, p, _ in ready:
-                        mark_failed(ep, f"HF upload: {e}")
-                        failed += 1
-                        log.append(f"FAIL {p}: HF upload: {short(e, 160)}")
-                    print(f"  HF upload imeshindwa: {short(e, 200)}", flush=True)
-                else:
-                    for ep, p, _ in ready:
-                        url = f"{HF_BASE[HF_REPO_TYPE]}{HF_REPO}/resolve/main/{p}"
-                        mark_done(ep, url)
-                        done += 1
-                        log.append(f"OK   {p}")
-                        print(f"  OK {p}", flush=True)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+def drive_id_of(u):
+    m = re.search(r"drive\.google\.com/(?:file/d/|open\?(?:[^#]*&)?id=|uc\?(?:[^#]*&)?id=)([\w-]{10,})", u, re.I)
+    return m.group(1) if m else None
 
-    summary = (f"Imekamilika: done={done}, failed={failed}, quota_retry={quota_hits}, "
-               f"dakika={(time.time() - started) / 60:.1f}")
-    print(summary, flush=True)
-    write_summary(["### Absalom converter", summary, "", "```", *log[-200:], "```"])
-    return 0
+
+def parse_eps(html):
+    html = re.sub(r"&#0?39;|&apos;", "'", html)
+    out = []
+    for m in re.finditer(r"startDownload\(\s*'([^']*)'\s*,\s*'([^']*)'\s*\)", html):
+        if not m.group(1).strip():
+            continue
+        url = decode(m.group(1).strip())
+        out.append({"label": decode(m.group(2).strip()), "drive_url": url, "drive_id": drive_id_of(url), "mp4_url": None})
+    return out
+
+
+def sitemap():
+    out, seen = [], set()
+    for m in re.finditer(r"<url>\s*<loc>([^<]+)</loc>(?:\s*<lastmod>([^<]*)</lastmod>)?", get_text(SITE + "/sitemap.php"), re.I):
+        url = decode(m.group(1).strip())
+        pm = re.search(r"/post/([^/?#]+)", url)
+        if not pm or url in seen:
+            continue
+        seen.add(url)
+        out.append({"slug": urllib.parse.unquote(pm.group(1)), "url": url, "lastmod": (m.group(2) or "").strip() or None})
+    return out
+
+
+def fetch_post(e):
+    html = get_text(e["url"])
+    h1 = re.search(r"<h1[^>]*>([\s\S]*?)</h1>", html, re.I)
+    pslug = re.search(r'id="slug"[^>]*value="([^"]*)"', html, re.I)
+    img = re.search(r'class="details-image"[\s\S]*?<img[^>]+src="([^"]+)"', html, re.I)
+    total = re.search(r'class="count"[^>]*>\s*(\d+)\s*Total', html, re.I)
+    eps = parse_eps(html)
+    key = lambda x: x["label"] + "|" + x["drive_url"]  # noqa
+    seen = {key(x) for x in eps}
+    declared = int(total.group(1)) if total else None
+    for p in range(1, 61):
+        if not (len(eps) >= PAGE or (declared or 0) > len(eps)):
+            break
+        more = get_text(SITE + "/data/fetch_episode.php",
+                        data={"starting": str(p * PAGE), "slug": decode(pslug.group(1)) if pslug else e["slug"]},
+                        headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                                 "X-Requested-With": "XMLHttpRequest", "Referer": e["url"], "Origin": SITE})
+        fresh = [x for x in parse_eps(more) if key(x) not in seen] if more.strip() else []
+        if not fresh:
+            break
+        seen.update(key(x) for x in fresh)
+        eps += fresh
+        time.sleep(0.15)
+    return {"slug": e["slug"], "url": e["url"], "lastmod": e["lastmod"], "title": strip(h1.group(1)) if h1 else e["slug"],
+            "poster": decode(img.group(1)) if img else None, "episodes": eps}
+
+
+def disp_name(cd):
+    s = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.I)
+    m = re.search(r'filename="?([^";]+)"?', cd, re.I)
+    if s:
+        return urllib.parse.unquote(s.group(1)).strip('"')
+    if m:
+        try:
+            return m.group(1).encode("latin-1").decode("utf-8")
+        except Exception:  # noqa
+            return m.group(1)
+    return None
+
+
+def drive_name(i):
+    if i in NAMES:
+        return NAMES[i]
+    try:
+        r = requests.get(DRIVE_DL, params={"id": i, "export": "download", "confirm": "t"},
+                         headers={"User-Agent": DRIVE_UA, "Range": "bytes=0-0"}, stream=True, timeout=30)
+        n = disp_name(r.headers.get("content-disposition", ""))
+        r.close()
+        if n:
+            NAMES[i] = n
+        return n
+    except Exception:  # noqa
+        return None
+
+
+def hf_url(repo, path):
+    return f"https://huggingface.co/datasets/{repo}/resolve/main/{urllib.parse.quote(path)}"
+
+
+def run_netswahili():
+    entries = sitemap()
+    if SINCE_DAYS:
+        cutoff = (date.today() - timedelta(days=SINCE_DAYS)).isoformat()
+        entries = [e for e in entries if not e["lastmod"] or e["lastmod"][:10] >= cutoff]
+    print(f"[netswahili] posts za kuchunguza: {len(entries)}")
+    todo, posts, reasons = [], [], {"no_drive_id": 0, "drive_unavailable": 0}
+    for e in entries:
+        try:
+            post = fetch_post(e)
+        except Exception as ex:  # noqa
+            print("FAIL post", e["slug"], ex, file=sys.stderr)
+            continue
+        for ep in post["episodes"]:
+            if not ep["drive_id"]:
+                reasons["no_drive_id"] += 1
+                continue
+            name = drive_name(ep["drive_id"])
+            if not name:
+                reasons["drive_unavailable"] += 1
+                continue
+            path = "videos/" + mp4_name(name)
+            if exists(NETS_REPO, path):
+                ep["mp4_url"] = hf_url(NETS_REPO, path)
+            else:
+                todo.append((post, ep, path))
+        posts.append(post)
+    print(f"[netswahili] bado hazijageuzwa: {len(todo)} | zimeshindwa Drive/hazina kiungo: {reasons}")
+    for post, ep, path in todo[:BATCH]:
+        try:
+            convert_and_upload(ep["drive_id"], NETS_REPO, lambda _f, p=path: p)
+            ep["mp4_url"] = hf_url(NETS_REPO, path)
+            print("OK  ", "netswahili", path)
+        except Exception as ex:  # noqa
+            print("FAIL netswahili", post["slug"], ep["drive_id"], ex, file=sys.stderr)
+    send = [{"slug": p["slug"], "title": p["title"], "poster": p["poster"],
+             "episodes": [{"label": x["label"], "mp4_url": x["mp4_url"]} for x in p["episodes"]]}
+            for p in posts if any(x["mp4_url"] for x in p["episodes"])]
+    for i in range(0, len(send), 20):
+        res = cf("POST", "/n2/import-rows", json={"posts": send[i:i + 20]})
+        print("[netswahili] n2:", {k: res.get(k) for k in ("added", "updated", "skipped_no_mp4")})
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    for s in SOURCES:
+        try:
+            run_netswahili() if s == "netswahili" else run_cloudflare(s)
+        except Exception as e:  # noqa
+            print(f"[{s}] imeshindwa: {e}", file=sys.stderr)

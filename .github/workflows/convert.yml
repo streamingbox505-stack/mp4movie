@@ -1,0 +1,25 @@
+name: convert-episodes
+on:
+  schedule:
+    - cron: "17 */3 * * *"     # kila masaa 3
+  workflow_dispatch:
+concurrency:
+  group: convert
+  cancel-in-progress: false     # run mbili zisigongane
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q requests gdown huggingface_hub
+      - run: python convert.py
+        env:
+          CF_API: ${{ secrets.CF_API }}
+          ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          BATCH: "3"
+          NETS_SINCE_DAYS: "14"

@@ -12,12 +12,29 @@ from huggingface_hub import HfApi
 
 CF_API = os.environ.get("CF_API", "").rstrip("/")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
-HF_TOKEN = os.environ["HF_TOKEN"]
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 BATCH = int(os.environ.get("BATCH", "3"))
 SOURCES = [s.strip() for s in os.environ.get("SOURCES", "absalom,movies,ngwele,netswahili").split(",") if s.strip()]
 SINCE_DAYS = int(os.environ.get("NETS_SINCE_DAYS", "14"))
 NETS_REPO = os.environ.get("NETS_REPO", "JAYNESTV/iphone-stream")
-api = HfApi(token=HF_TOKEN)
+api = HfApi(token=HF_TOKEN or None)
+
+
+def preflight():
+    """Kagua mipangilio kabla ya kupakua chochote (inazuia kupoteza muda na data kwa mipangilio mibaya)."""
+    p = []
+    if not HF_TOKEN:
+        p.append("HF_TOKEN haijawekwa (GitHub secret HF_TOKEN)")
+    if not CF_API.startswith("http"):
+        p.append("CF_API haijawekwa au si URL kamili (secret CF_API = https://tr-admin.jaynes-max.workers.dev)")
+    if not ADMIN_KEY:
+        p.append("ADMIN_KEY haijawekwa (GitHub secret ADMIN_KEY)")
+    for tool in ("ffmpeg", "ffprobe", "gdown"):
+        if not shutil.which(tool):
+            p.append(f"zana ya '{tool}' haipo (workflow lazima iisakinishe)")
+    if p:
+        print("MIPANGILIO MIBAYA:\n - " + "\n - ".join(p), file=sys.stderr)
+        sys.exit(2)
 UA = {"User-Agent": "JaynesMaxTV-converter/1.0"}  # Cloudflare inakataa UA za chaguo-msingi za Python (403 / 1010)
 
 
@@ -278,8 +295,12 @@ def run_netswahili():
 
 
 if __name__ == "__main__":
+    preflight()
+    failed = False
     for s in SOURCES:
         try:
             run_netswahili() if s == "netswahili" else run_cloudflare(s)
         except Exception as e:  # noqa
+            failed = True
             print(f"[{s}] imeshindwa: {e}", file=sys.stderr)
+    sys.exit(1 if failed else 0)

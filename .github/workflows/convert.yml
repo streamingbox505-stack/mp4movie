@@ -1,7 +1,7 @@
 name: convert-episodes
 on:
   schedule:
-    - cron: "17 */3 * * *"     # kila masaa 3
+    - cron: "17 */2 * * *"     # kila masaa 2
   workflow_dispatch:
 concurrency:
   group: convert
@@ -19,8 +19,10 @@ jobs:
       - run: pip install -q requests gdown huggingface_hub
       - run: python convert.py
         env:
-          CF_API: ${{ secrets.CF_API }}
+          CF_API: https://tr-admin.jaynes-max.workers.dev   # si siri (ufunguo wa ADMIN_KEY ndio unalinda)
           ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          BATCH: "3"
+          BATCH: "3"            # chanzo kingine kila kimoja
+          BATCH_ABSALOM: "50"   # Absalom: 50 kwa kila run
+          MAX_RUN_MIN: "300"    # usianze kazi mpya baada ya dakika 300
           NETS_SINCE_DAYS: "14"

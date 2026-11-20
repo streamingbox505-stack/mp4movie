@@ -14,6 +14,13 @@ CF_API = os.environ.get("CF_API", "").rstrip("/")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 BATCH = int(os.environ.get("BATCH", "3"))
+BATCHES = {k: int(os.environ.get("BATCH_" + k.upper(), BATCH)) for k in ("absalom", "movies", "ngwele", "netswahili")}
+MAX_RUN_MIN = int(os.environ.get("MAX_RUN_MIN", "300"))  # usianze kazi mpya baada ya dakika hizi (job ya GitHub ina kikomo cha saa 6)
+DEADLINE = time.time() + MAX_RUN_MIN * 60
+
+
+def out_of_time():
+    return time.time() > DEADLINE
 SOURCES = [s.strip() for s in os.environ.get("SOURCES", "absalom,movies,ngwele,netswahili").split(",") if s.strip()]
 SINCE_DAYS = int(os.environ.get("NETS_SINCE_DAYS", "14"))
 NETS_REPO = os.environ.get("NETS_REPO", "JAYNESTV/iphone-stream")
@@ -109,28 +116,48 @@ def convert_and_upload(drive_id, repo, path_fn):
             return path, None, None, True
         dst = tmp + "/out.mp4"
         dur = make_mp4(src, dst)
-        api.upload_file(path_or_fileobj=dst, path_in_repo=path, repo_id=repo, repo_type="dataset")
+        for attempt in range(4):
+            try:
+                api.upload_file(path_or_fileobj=dst, path_in_repo=path, repo_id=repo, repo_type="dataset")
+                break
+            except Exception as e:  # noqa
+                if attempt == 3 or not re.search(r"429|rate|timed? ?out|5\d\d", str(e), re.I):
+                    raise
+                print(f"  upload imekataliwa ({str(e)[:80]}), nasubiri {60 * (attempt + 1)}s...")
+                time.sleep(60 * (attempt + 1))
         return path, os.path.getsize(dst), int(dur), False
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 def run_cloudflare(source):
-    jobs = cf("GET", f"/jobs?source={source}&limit={BATCH}").get("jobs", [])
-    print(f"[{source}] kazi: {len(jobs)}")
-    for j in jobs:
-        rep = {"source": source, "id": j.get("id"), "key": j.get("key"), "hf_path": j["hf_path"]}
-        try:
-            if exists(j["repo"], j["hf_path"]):
-                rep.update(ok=True)  # tayari ipo HF, usipakue tena
-            else:
-                _, size, dur, _ = convert_and_upload(j["drive_id"], j["repo"], lambda _f, p=j["hf_path"]: p)
-                rep.update(ok=True, size_bytes=size, duration_sec=dur)
-            print("OK  ", source, j["hf_path"])
-        except Exception as e:  # noqa
-            rep.update(ok=False, error=str(e)[:200])
-            print("FAIL", source, j["hf_path"], e, file=sys.stderr)
-        cf("POST", "/report", json=rep)
+    """Inachukua kazi kwa vipande vya 20 (kikomo cha tr-admin) hadi idadi ya BATCH ya chanzo hiki itimie."""
+    target, seen, count = BATCHES[source], set(), 0
+    while count < target and not out_of_time():
+        fresh = [j for j in cf("GET", f"/jobs?source={source}&limit=20").get("jobs", [])
+                 if (j.get("id") if j.get("id") is not None else j.get("key")) not in seen]
+        if not fresh:
+            break  # hakuna kazi mpya (zilizobaki zimeshindwa mara hii na zitajaribiwa run ijayo)
+        fresh = fresh[: target - count]
+        print(f"[{source}] kazi: {len(fresh)} (jumla hadi sasa {count}/{target})")
+        for j in fresh:
+            if out_of_time():
+                print(f"[{source}] muda umeisha, zilizobaki zinasubiri run ijayo")
+                return
+            seen.add(j.get("id") if j.get("id") is not None else j.get("key"))
+            count += 1
+            rep = {"source": source, "id": j.get("id"), "key": j.get("key"), "hf_path": j["hf_path"]}
+            try:
+                if exists(j["repo"], j["hf_path"]):
+                    rep.update(ok=True)  # tayari ipo HF, usipakue tena
+                else:
+                    _, size, dur, _ = convert_and_upload(j["drive_id"], j["repo"], lambda _f, p=j["hf_path"]: p)
+                    rep.update(ok=True, size_bytes=size, duration_sec=dur)
+                print("OK  ", source, j["hf_path"])
+            except Exception as e:  # noqa
+                rep.update(ok=False, error=str(e)[:200])
+                print("FAIL", source, j["hf_path"], e, file=sys.stderr)
+            cf("POST", "/report", json=rep)
 
 
 # ---------- netswahili.com (port ya movie-public) ----------
@@ -279,7 +306,10 @@ def run_netswahili():
                 todo.append((post, ep, path))
         posts.append(post)
     print(f"[netswahili] bado hazijageuzwa: {len(todo)} | zimeshindwa Drive/hazina kiungo: {reasons}")
-    for post, ep, path in todo[:BATCH]:
+    for post, ep, path in todo[:BATCHES["netswahili"]]:
+        if out_of_time():
+            print("[netswahili] muda umeisha, zilizobaki zinasubiri run ijayo")
+            break
         try:
             convert_and_upload(ep["drive_id"], NETS_REPO, lambda _f, p=path: p)
             ep["mp4_url"] = hf_url(NETS_REPO, path)

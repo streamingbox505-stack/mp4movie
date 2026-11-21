@@ -4,7 +4,7 @@
                              posts zenye mp4 zinatumwa kwa tr-admin /n2/import-rows (Zilizotafsiriwa za n2)
 Video hazipiti Supabase wala Cloudflare: Drive -> runner ya GitHub -> Hugging Face.
 Env: CF_API, ADMIN_KEY, HF_TOKEN | BATCH=3 SOURCES=absalom,movies,ngwele,netswahili
-     NETS_SINCE_DAYS=14 (0 = zote) MAIN_REPO=jaynesmaxtv/movie-file NETS_REPO=JAYNESTV/iphone-stream"""
+     NETS_SINCE_DAYS=14 (0 = zote) MAIN_REPO=jaynesmaxtv/movie-file NETS_REPO=jaynesmaxtv/movie-file"""
 import glob, html as htmllib, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.parse
 from datetime import date, timedelta
 import requests
@@ -23,7 +23,7 @@ def out_of_time():
     return time.time() > DEADLINE
 SOURCES = [s.strip() for s in os.environ.get("SOURCES", "absalom,movies,ngwele,netswahili").split(",") if s.strip()]
 SINCE_DAYS = int(os.environ.get("NETS_SINCE_DAYS", "14"))
-NETS_REPO = os.environ.get("NETS_REPO", "JAYNESTV/iphone-stream")
+NETS_REPO = os.environ.get("NETS_REPO", "jaynesmaxtv/movie-file")
 api = HfApi(token=HF_TOKEN or None)
 
 
@@ -84,7 +84,20 @@ def make_mp4(src, dst):
 
 
 def download(drive_id, tmp):
-    subprocess.check_call(["gdown", f"https://drive.google.com/uc?id={drive_id}", "-O", tmp + "/", "-q"])
+    r = subprocess.run(["gdown", f"https://drive.google.com/uc?id={drive_id}", "-O", tmp + "/"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout or "").strip()
+        low = msg.lower()
+        if "too many users" in low or "quota" in low:
+            why = "drive_quota: faili limetazamwa/kupakuliwa mara nyingi sana, jaribu baadaye"
+        elif "permission" in low or "access denied" in low or "cannot retrieve the public link" in low:
+            why = "drive_private: faili si la umma (ruhusa)"
+        elif "not found" in low or "404" in low:
+            why = "drive_not_found: faili halipo"
+        else:
+            why = "gdown: " + (msg.splitlines()[-1] if msg else f"exit {r.returncode}")
+        raise RuntimeError(why[:190])
     files = [f for f in glob.glob(tmp + "/*") if os.path.isfile(f)]
     if not files:
         raise RuntimeError("drive_haikupakuliwa")
@@ -133,31 +146,44 @@ def convert_and_upload(drive_id, repo, path_fn):
 def run_cloudflare(source):
     """Inachukua kazi kwa vipande vya 20 (kikomo cha tr-admin) hadi idadi ya BATCH ya chanzo hiki itimie."""
     target, seen, count = BATCHES[source], set(), 0
-    while count < target and not out_of_time():
-        fresh = [j for j in cf("GET", f"/jobs?source={source}&limit=20").get("jobs", [])
-                 if (j.get("id") if j.get("id") is not None else j.get("key")) not in seen]
-        if not fresh:
-            break  # hakuna kazi mpya (zilizobaki zimeshindwa mara hii na zitajaribiwa run ijayo)
-        fresh = fresh[: target - count]
-        print(f"[{source}] kazi: {len(fresh)} (jumla hadi sasa {count}/{target})")
-        for j in fresh:
-            if out_of_time():
-                print(f"[{source}] muda umeisha, zilizobaki zinasubiri run ijayo")
-                return
-            seen.add(j.get("id") if j.get("id") is not None else j.get("key"))
-            count += 1
-            rep = {"source": source, "id": j.get("id"), "key": j.get("key"), "hf_path": j["hf_path"]}
-            try:
-                if exists(j["repo"], j["hf_path"]):
-                    rep.update(ok=True)  # tayari ipo HF, usipakue tena
-                else:
-                    _, size, dur, _ = convert_and_upload(j["drive_id"], j["repo"], lambda _f, p=j["hf_path"]: p)
-                    rep.update(ok=True, size_bytes=size, duration_sec=dur)
-                print("OK  ", source, j["hf_path"])
-            except Exception as e:  # noqa
-                rep.update(ok=False, error=str(e)[:200])
-                print("FAIL", source, j["hf_path"], e, file=sys.stderr)
-            cf("POST", "/report", json=rep)
+    stats = {"imefanikiwa": 0, "imeshindwa": 0, "ripoti_zimefika": 0, "ripoti_hazikufika": 0}
+    try:
+        while count < target and not out_of_time():
+            fresh = [j for j in cf("GET", f"/jobs?source={source}&limit=20").get("jobs", [])
+                     if (j.get("id") if j.get("id") is not None else j.get("key")) not in seen]
+            if not fresh:
+                break  # hakuna kazi mpya (zilizobaki zimeshindwa mara hii na zitajaribiwa run ijayo)
+            fresh = fresh[: target - count]
+            print(f"[{source}] kazi: {len(fresh)} (jumla hadi sasa {count}/{target})")
+            for j in fresh:
+                if out_of_time():
+                    print(f"[{source}] muda umeisha, zilizobaki zinasubiri run ijayo")
+                    return
+                seen.add(j.get("id") if j.get("id") is not None else j.get("key"))
+                count += 1
+                rep = {"source": source, "id": j.get("id"), "key": j.get("key"), "hf_path": j["hf_path"]}
+                try:
+                    if exists(j["repo"], j["hf_path"]):
+                        rep.update(ok=True)  # tayari ipo HF, usipakue tena
+                    else:
+                        _, size, dur, _ = convert_and_upload(j["drive_id"], j["repo"], lambda _f, p=j["hf_path"]: p)
+                        rep.update(ok=True, size_bytes=size, duration_sec=dur)
+                    stats["imefanikiwa"] += 1
+                    print("OK  ", source, j["hf_path"])
+                except Exception as e:  # noqa
+                    stats["imeshindwa"] += 1
+                    rep.update(ok=False, error=str(e)[:200])
+                    print("FAIL", source, j["hf_path"], e, file=sys.stderr)
+                try:  # ripoti ikishindwa, video bado imepakiwa HF; tutaendelea na zingine na kuonyesha kosa wazi
+                    cf("POST", "/report", json=rep)
+                    stats["ripoti_zimefika"] += 1
+                except Exception as e:  # noqa
+                    stats["ripoti_hazikufika"] += 1
+                    print("RIPOTI IMESHINDWA", source, j["hf_path"], e, file=sys.stderr)
+    finally:
+        print(f"[{source}] muhtasari: {stats}")
+    if stats["ripoti_hazikufika"]:
+        raise RuntimeError(f"{stats['ripoti_hazikufika']} ripoti hazikufika D1 (angalia ADMIN_KEY / Worker / kikomo cha D1)")
 
 
 # ---------- netswahili.com (port ya movie-public) ----------

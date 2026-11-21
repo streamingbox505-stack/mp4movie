@@ -26,3 +26,5 @@ jobs:
           BATCH_ABSALOM: "50"   # Absalom: 50 kwa kila run
           MAX_RUN_MIN: "300"    # usianze kazi mpya baada ya dakika 300
           NETS_SINCE_DAYS: "14"
+          NETS_REPO: jaynesmaxtv/movie-file
+          MAIN_REPO: jaynesmaxtv/movie-file
